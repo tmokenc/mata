@@ -16,7 +16,9 @@
 
 namespace mata::nft::lazy {
 
-typedef uint32_t NodeId;
+using NodeId = uint32_t;
+using MacroStateId = uint32_t;
+
 
 class Term {
     NodeId id;
@@ -33,8 +35,6 @@ public:
     TermNft(NodeId id) : id{id} {};
     NodeId get_id() const { return id; }
 };
-
-typedef uint32_t MacroStateId;
 
 
 enum class NodeKind : uint8_t {
@@ -93,10 +93,12 @@ public:
     TermNft compose(const TermNft& t1, const TermNft& t2);
 
     /// Check if the given term is valid, that is does not contain any loop.
-    bool is_valid() const;
+    bool is_valid(const Term& root_node) const;
+    bool is_valid(const TermNft& root_node) const;
 
-    bool is_empty(const Term& t);
-    bool is_empty(const TermNft& t);
+    /// Decide emptiness of the nfa / nft represented by @p root_node.
+    bool is_empty(const Term& root_node);
+    bool is_empty(const TermNft& root_node);
 };
 
 

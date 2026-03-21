@@ -1,8 +1,9 @@
-/** @file
+/** @file lazy.cc
  * @brief Lazy on-the-fly emptiness checking for symbolic combinations of NFAs and (2-level) NFTs.
  *
- *
- *
+ * TODO: Coonvert into iterator-based API to make it more lazy,
+ *       as the number of macro states can be very large,
+ *       and we may not want to generate all of them at once.
  */
 
 #include "mata/nft/lazy.hh"
@@ -21,11 +22,115 @@
 #include <unordered_set>
 #include <vector>
 
+
 using namespace mata::nft::lazy;
 
-bool SymbolicAutomataTree::is_valid() const {
-    return true; // TODO
+
+enum class ResultSort : uint8_t {
+    Nfa = 0,
+    Nft = 1,
+};
+
+ResultSort result_sort(const NodeKind kind) {
+    switch (kind) {
+        case NodeKind::LeafNfa:
+        case NodeKind::Union:
+        case NodeKind::Intersect:
+        case NodeKind::Complement:
+        case NodeKind::PreImage:
+        case NodeKind::PostImage:
+            return ResultSort::Nfa;
+        case NodeKind::LeafNft:
+        case NodeKind::ComplementNft:
+        case NodeKind::Compose:
+            return ResultSort::Nft;
+    }
 }
+
+/// helper enum
+enum class VisitState : uint8_t {
+    Unseen = 0,
+    Active = 1,
+    Done = 2,
+};
+
+bool validate_node(
+        const SymbolicAutomataTree& tree, const NodeId node_id, const ResultSort expected,
+        std::vector<VisitState>& marks) {
+    if (node_id >= tree.nodes.size()) {
+        return false;
+    }
+
+    if (result_sort(tree.nodes[node_id].kind) != expected) {
+        return false;
+    }
+
+    switch (marks[node_id]) {
+        case VisitState::Unseen:
+            // continue
+            break;
+        case VisitState::Active:
+            // If the node is already visited and marked as done, we can just return true.
+            return false;
+        case VisitState::Done:
+            // If the node is already visited and marked as active,
+            // it means there is a cycle in the tree, which is invalid.
+            return true;
+    }
+
+    marks[node_id] = VisitState::Active;
+    const Node& node = tree.nodes[node_id];
+    bool ok = true;
+
+    switch (node.kind) {
+        case NodeKind::LeafNfa:
+            ok = node.lhs < tree.nfas.size();
+            break;
+
+        case NodeKind::LeafNft:
+            ok = node.lhs < tree.nfts.size();
+            break;
+
+        case NodeKind::Union:
+        case NodeKind::Intersect:
+            ok = validate_node(tree, node.lhs, ResultSort::Nfa, marks) &&
+                 validate_node(tree, node.rhs, ResultSort::Nfa, marks);
+            break;
+
+        case NodeKind::Complement:
+            ok = validate_node(tree, node.lhs, ResultSort::Nfa, marks);
+            break;
+
+        case NodeKind::ComplementNft:
+            ok = validate_node(tree, node.lhs, ResultSort::Nft, marks);
+            break;
+
+        case NodeKind::PreImage:
+        case NodeKind::PostImage:
+            ok = validate_node(tree, node.lhs, ResultSort::Nfa, marks) &&
+                 validate_node(tree, node.rhs, ResultSort::Nft, marks);
+            break;
+
+        case NodeKind::Compose:
+            ok = validate_node(tree, node.lhs, ResultSort::Nft, marks) &&
+                 validate_node(tree, node.rhs, ResultSort::Nft, marks);
+            break;
+    }
+
+    marks[node_id] = ok ? VisitState::Done : VisitState::Unseen;
+    return ok;
+}
+
+bool SymbolicAutomataTree::is_valid(const Term& root_node) const {
+    std::vector<VisitState> marks(nodes.size(), VisitState::Unseen);
+    return validate_node(*this, root_node.get_id(), ResultSort::Nfa, marks);
+}
+
+bool SymbolicAutomataTree::is_valid(const TermNft& root_node) const {
+    std::vector<VisitState> marks(nodes.size(), VisitState::Unseen);
+    return validate_node(*this, root_node.get_id(), ResultSort::Nft, marks);
+}
+
 
 Term SymbolicAutomataTree::make_term(const nfa::Nfa& nfa) {
     const NodeId nfa_id = static_cast<NodeId>(nfas.size());
@@ -90,7 +195,6 @@ struct TaggedState {
 };
 
 using SetState = std::unordered_set<MacroStateId>;
-using BitsetState = std::bitset<64>;
 
 uint32_t hash_states(const SetState& states) {
     uint32_t hash = 0;
@@ -105,30 +209,22 @@ uint32_t hash_pair(const PairState& pair) { return pair.lhs ^ pair.rhs; }
 
 uint32_t hash_tagged(const TaggedState& tagged) { return tagged.state ^ (static_cast<uint32_t>(tagged.tag) << 31); }
 
-uint32_t hash_bitset(const BitsetState& bitset) {
-    // we can just use the built-in hash function for bitsets
-    size_t hash = std::hash<BitsetState>()(bitset);
-    return static_cast<uint32_t>(hash);
-}
-
 // TODO: optimize this
 struct MacroStateStore {
     using PairStore = std::unordered_map<MacroStateId, PairState>;
     using SetStore = std::unordered_map<MacroStateId, SetState>;
     using TaggedStore = std::unordered_map<MacroStateId, TaggedState>;
-    using BitsetStore = std::unordered_map<MacroStateId, BitsetState>;
 
     // Index to the store
     // The i-th node is the index to this, which will point to the store for the i-th node
     // type of store is determined by the node kind
-    std::vector<size_t> index_pair_stores;
+    std::vector<size_t> node_to_store_index;
 
     std::vector<PairStore> pair_stores;
     std::vector<SetStore> set_stores;
     std::vector<TaggedStore> tagged_stores;
-    std::vector<BitsetStore> bitset_stores;
 
-    MacroStateStore() = default;
+    MacroStateStore() : node_to_store_index{}, pair_stores{}, set_stores{}, tagged_stores{} {};
 
     // Initialize the macro state store for the given nodes. For each node, we will create a store for its macro states
     // and store the index of the store in index_pair_stores. The type of store is determined by the node kind:
@@ -136,14 +232,12 @@ struct MacroStateStore {
     // - For union nodes, create a tagged store
     // - For intersect, preimage, postimage, compose nodes, create a pair store
     // - For complement nodes, create a set store
-    MacroStateStore(const std::vector<Node>& nodes)
-        : index_pair_stores(nodes.size(), 0), pair_stores{}, set_stores{}, tagged_stores{}, bitset_stores{} {
+    explicit MacroStateStore(const std::vector<Node>& nodes)
+        : node_to_store_index(nodes.size(), 0), pair_stores{}, set_stores{}, tagged_stores{} {
         for (size_t i = 0; i < nodes.size(); i++) {
-            Node node = nodes[i];
-
-            switch (node.kind) {
+            switch (nodes[i].kind) {
                 case NodeKind::Union: {
-                    index_pair_stores.push_back(tagged_stores.size());
+                    node_to_store_index[i] = tagged_stores.size();
                     tagged_stores.emplace_back();
                     break;
                 }
@@ -152,14 +246,14 @@ struct MacroStateStore {
                 case NodeKind::PreImage:
                 case NodeKind::PostImage:
                 case NodeKind::Compose: {
-                    index_pair_stores.push_back(pair_stores.size());
+                    node_to_store_index[i] = pair_stores.size();
                     pair_stores.emplace_back();
                     break;
                 }
 
                 case NodeKind::Complement:
                 case NodeKind::ComplementNft: {
-                    index_pair_stores.push_back(set_stores.size());
+                    node_to_store_index[i] = set_stores.size();
                     set_stores.emplace_back();
                     break;
                 }
@@ -172,28 +266,29 @@ struct MacroStateStore {
     }
 
     PairState get_pair(const uint32_t idx, const MacroStateId& id) {
-        PairStore& store = pair_stores[index_pair_stores[idx]];
-        return store[id];
+        PairStore& store = pair_stores[node_to_store_index[idx]];
+        const auto& it = store.find(id);
+        assert(it != store.end());
+        return it->second;
     }
 
     SetState get_set(const uint32_t idx, const MacroStateId& id) {
-        SetStore& store = set_stores[index_pair_stores[idx]];
-        return store[id];
+        SetStore& store = set_stores[node_to_store_index[idx]];
+        const auto& it = store.find(id);
+        assert(it != store.end());
+        return it->second;
     }
 
     TaggedState get_tagged(const uint32_t idx, const MacroStateId& id) {
-        TaggedStore& store = tagged_stores[index_pair_stores[idx]];
-        return store[id];
-    }
-
-    BitsetState get_bitset(const uint32_t idx, const MacroStateId& id) {
-        BitsetStore& store = bitset_stores[index_pair_stores[idx]];
-        return store[id];
+        TaggedStore& store = tagged_stores[node_to_store_index[idx]];
+        const auto& it = store.find(id);
+        assert(it != store.end());
+        return it->second;
     }
 
     // Intern a macro state and return its id. If the state already exists, return the existing id.
-    MacroStateId intern(const uint32_t idx, const std::unordered_set<MacroStateId>&& states) {
-        SetStore& store = set_stores[index_pair_stores[idx]];
+    MacroStateId intern(const NodeId idx, SetState states) {
+        SetStore& store = set_stores[node_to_store_index[idx]];
         MacroStateId id = hash_states(states);
 
         // Check for the states with the same hash, if they are the same as the input states, return their id,
@@ -205,12 +300,12 @@ struct MacroStateStore {
             id++;
         }
 
-        store.emplace(id, states);
+        store.emplace(id, std::move(states));
         return id;
     }
 
-    MacroStateId intern(const uint32_t idx, const PairState&& pair) {
-        PairStore& store = pair_stores[index_pair_stores[idx]];
+    MacroStateId intern(const uint32_t idx, const PairState pair) {
+        PairStore& store = pair_stores[node_to_store_index[idx]];
         MacroStateId id = hash_pair(pair);
 
         while (store.contains(id)) {
@@ -225,7 +320,7 @@ struct MacroStateStore {
     }
 
     MacroStateId intern(const uint32_t idx, const TaggedState&& tagged) {
-        TaggedStore& store = tagged_stores[index_pair_stores[idx]];
+        TaggedStore& store = tagged_stores[node_to_store_index[idx]];
         MacroStateId id = hash_tagged(tagged);
 
         while (store.contains(id)) {
@@ -238,21 +333,6 @@ struct MacroStateStore {
         store.emplace(id, tagged);
         return id;
     }
-
-    MacroStateId intern(const uint32_t idx, const std::bitset<64>&& bitset) {
-        BitsetStore& store = bitset_stores[index_pair_stores[idx]];
-        MacroStateId id = hash_bitset(bitset);
-
-        while (store.contains(id)) {
-            if (store[id] == bitset) {
-                return id;
-            }
-            id++;
-        }
-
-        store.emplace(id, bitset);
-        return id;
-    }
 };
 
 /// Node reconstruction
@@ -260,7 +340,7 @@ struct MacroStateStore {
 /// Also try to push the complement down as much as possible,
 /// so that the resulting tree is more suitable for on-the-fly emptiness checking.
 NodeId reconstruct_nodes(
-        const std::vector<Node>& original_nodes, NodeId id, std::vector<Node> output,
+        const std::vector<Node>& original_nodes, NodeId id, std::vector<Node>& output,
         std::unordered_set<NodeId> visited = {}) {
     if (visited.contains(id)) {
         // Error: cycle detected in the original tree
@@ -275,6 +355,7 @@ NodeId reconstruct_nodes(
     }
 
     Node node = original_nodes[id];
+    visited.insert(id);
 
     switch (node.kind) {
         case NodeKind::LeafNfa:
@@ -329,7 +410,6 @@ NodeId reconstruct_nodes(
 
                 case NodeKind::Complement: {
                     // Double negation: complement of complement is the original node
-                    visited.insert(id);
                     return reconstruct_nodes(original_nodes, child_node.lhs, output, visited);
                 }
 
@@ -349,7 +429,6 @@ NodeId reconstruct_nodes(
 
             if (child_node.kind == NodeKind::ComplementNft) {
                 // Double negation: complement of complement is the original node
-                visited.insert(id);
                 return reconstruct_nodes(original_nodes, child_node.lhs, output, visited);
             }
 
@@ -359,7 +438,6 @@ NodeId reconstruct_nodes(
         }
     }
 
-    visited.insert(id);
     return static_cast<NodeId>(output.size() - 1);
 }
 
@@ -394,7 +472,7 @@ struct Context {
     Context();
 
     Context(const SymbolicAutomataTree& tree, NodeId root)
-        : nfas(tree.nfas), nfts(tree.nfts), nodes{}, macro_store{}, alphabets{}, precomputed_simulations{} {
+        : nfas(tree.nfas), nfts(tree.nfts), nodes{}, macro_store{}, alphabets{}, precomputed_simulations{}, root_id{0} {
         root_id = reconstruct_nodes(tree.nodes, root, nodes);
         macro_store = MacroStateStore(nodes);
 
@@ -403,79 +481,54 @@ struct Context {
         alphabets.reserve(nfas.size() + nfts.size());
         precomputed_simulations.reserve(nfas.size() + nfts.size());
 
-        std::list<NodeId> worklist = {root_id};
-        std::unordered_set<NodeId> processed = {};
+        std::vector<bool> visited(nodes.size(), false);
+        resolve_metadata(root_id, visited);
+    };
 
-        while (!worklist.empty()) {
-            NodeId node_id = worklist.front();
-            worklist.pop_front();
+    // This function is used to resolve the metadata for each node,
+    // which includes the alphabets and precomputed simulations.
+    void resolve_metadata(const NodeId node_id, std::vector<bool>& visited) {
+        if (visited[node_id]) {
+            return;
+        }
 
-            Node node = nodes[node_id];
+        const Node& node = nodes[node_id];
 
-            switch (node.kind) {
-                case NodeKind::LeafNfa: {
-                    const Nfa& nfa = nfas[node.lhs];
-                    alphabets[node_id] = create_alphabet(nfa);
-                    precomputed_simulations.push_back(mata::nfa::algorithms::compute_relation(nfa));
-                    processed.insert(node_id);
-                    break;
-                }
+        switch (node.kind) {
+            case NodeKind::LeafNfa: {
+                const Nfa& nfa = nfas[node.lhs];
+                alphabets[node_id] = create_alphabet(nfa);
+                precomputed_simulations[node.lhs] = mata::nfa::algorithms::compute_relation(nfa);
+                break;
+            }
 
-                case NodeKind::LeafNft: {
-                    const Nft& nft = nfts[node.lhs];
-                    alphabets[node_id] = create_alphabet(nft);
-                    precomputed_simulations.push_back(mata::nft::algorithms::compute_relation(nft));
-                    processed.insert(node_id);
-                    break;
-                }
+            case NodeKind::LeafNft: {
+                const Nft& nft = nfts[node.lhs];
+                alphabets[node_id] = create_alphabet(nft);
+                precomputed_simulations[node.lhs + nfas.size()] = mata::nft::algorithms::compute_relation(nft);
+                break;
+            }
 
-                case NodeKind::Union:
-                case NodeKind::Intersect:
-                case NodeKind::PreImage:
-                case NodeKind::PostImage:
-                case NodeKind::Compose: {
-                    if (processed.contains(node.lhs) && processed.contains(node.rhs)) {
-                        // if both sides are visited, we can resolve the alphabet for this node and do not need to add
-                        // it to the worklist.
-                        const mata::OnTheFlyAlphabet& alphabet_lhs = alphabets[node.lhs];
-                        const mata::OnTheFlyAlphabet& alphabet_rhs = alphabets[node.rhs];
-
-                        mata::OnTheFlyAlphabet combined_alphabet{};
-
-                        for (const mata::Symbol sym : alphabet_lhs.get_alphabet_symbols()) {
-                            std::string name = alphabet_lhs.reverse_translate_symbol(sym);
-                            combined_alphabet.try_add_new_symbol(name, combined_alphabet.get_next_value());
-                        }
-
-                        for (const mata::Symbol sym : alphabet_rhs.get_alphabet_symbols()) {
-                            std::string name = alphabet_rhs.reverse_translate_symbol(sym);
-                            combined_alphabet.try_add_new_symbol(name, combined_alphabet.get_next_value());
-                        }
-
-                        alphabets[node_id] = combined_alphabet;
-                        processed.insert(node_id);
-                    } else {
-                        worklist.push_back(node.lhs);
-                        worklist.push_back(node.rhs);
-                    }
-                    break;
-                }
-
-                case NodeKind::Complement:
-                case NodeKind::ComplementNft: {
-                    if (processed.contains(node.lhs)) {
-                        // the alphabet of the complement node is the same as the alphabet of its child.
-                        alphabets[node_id] = alphabets[node.lhs];
-                        processed.insert(node_id);
-                    } else {
-                        worklist.push_back(node.lhs);
-                    }
-
-                    break;
-                }
+            case NodeKind::Union:
+            case NodeKind::Intersect:
+            case NodeKind::PreImage:
+            case NodeKind::PostImage:
+            case NodeKind::Compose: {
+                resolve_metadata(node.lhs, visited);
+                resolve_metadata(node.rhs, visited);
+                alphabets[node_id] = merge_alphabets(alphabets[node.lhs], alphabets[node.rhs]);
+                break;
+            }
+            case NodeKind::Complement:
+            case NodeKind::ComplementNft: {
+                resolve_metadata(node.lhs, visited);
+                alphabets[node_id] = alphabets[node.lhs];
+                break;
             }
         }
-    };
+
+        visited[node_id] = true;
+    }
 
     // TODO: should make this lazy by returning an iterator?
     // It is possible that the number of initial macro states to be very large.
@@ -563,28 +616,29 @@ struct Context {
     // The sym2 is used when transducer is involved, which is the symbol on the
     // output side of the transducer.
     std::list<MacroStateId>
-    next_macro_states(const NodeId& id, const MacroStateId& state, mata::Symbol sym, mata::Symbol sym2 = 0) {
+    next_macro_states(const NodeId& node_id, const MacroStateId& state, mata::Symbol sym, mata::Symbol sym2 = 0) {
         std::list<MacroStateId> next_states = {};
+        const Node& node = nodes[id];
 
-        switch (nodes[id].kind) {
+        switch (node.kind) {
             case NodeKind::LeafNfa: {
-                Nfa nfa = nfas[nodes[id].lhs];
-                State s = static_cast<State>(state);
+                const Nfa nfa = nfas[node.lhs];
+                const State s = static_cast<State>(state);
 
-                for (State next_state : nfa.delta.get_successors(s, sym)) {
+                for (const State next_state : nfa.delta.get_successors(s, sym)) {
                     next_states.push_back(static_cast<MacroStateId>(next_state));
                 }
 
                 break;
             }
             case NodeKind::LeafNft: {
-                Nft nft = nfts[nodes[id].lhs];
-                State s = static_cast<State>(state);
+                const Nft nft = nfts[node.lhs];
+                const State s = static_cast<State>(state);
 
                 // Move 2 steps in the NFT, first on sym on the input side, then on sym2 on the output side.
-                for (State next_state : nft.delta.get_successors(s, sym)) {
-                    for (State next_state2 : nft.delta.get_successors(next_state, sym2)) {
-                        next_states.push_back(static_cast<MacroStateId>(next_state2));
+                for (const State after_input : nft.delta.get_successors(s, sym)) {
+                    for (const State after_output : nft.delta.get_successors(after_input, sym2)) {
+                        next_states.push_back(static_cast<MacroStateId>(after_output));
                     }
                 }
 
@@ -593,12 +647,12 @@ struct Context {
 
 
             case NodeKind::Union: {
-                TaggedState tagged = macro_store.get_tagged(id, state);
-                NodeId next_node_id = (tagged.tag == TaggedState::Tag::Left) ? nodes[id].lhs : nodes[id].rhs;
+                const TaggedState tagged = macro_store.get_tagged(node_id, state);
+                const NodeId next_node_id = (tagged.tag == TaggedState::Tag::Left) ? node.lhs : node.rhs;
 
-                for (const MacroStateId& next_state : next_macro_states(next_node_id, tagged.state, sym)) {
+                for (const MacroStateId& next_state : next_macro_states(next_node_id, tagged.state, sym, sym2)) {
                     TaggedState next_tagged{next_state, tagged.tag};
-                    MacroStateId next_id = macro_store.intern(id, std::move(next_tagged));
+                    MacroStateId next_id = macro_store.intern(node_id, std::move(next_tagged));
                     next_states.push_back(next_id);
                 }
 
@@ -607,15 +661,15 @@ struct Context {
 
 
             case NodeKind::Intersect: {
-                PairState pair = macro_store.get_pair(id, state);
+                const PairState pair = macro_store.get_pair(node_id, state);
 
-                std::list<MacroStateId> next_lhs_states = next_macro_states(nodes[id].lhs, pair.lhs, sym);
-                std::list<MacroStateId> next_rhs_states = next_macro_states(nodes[id].rhs, pair.rhs, sym);
+                std::list<MacroStateId> next_lhs_states = next_macro_states(node.lhs, pair.lhs, sym, sym2);
+                std::list<MacroStateId> next_rhs_states = next_macro_states(node.rhs, pair.rhs, sym, sym2);
 
                 for (const MacroStateId& next_lhs_state : next_lhs_states) {
                     for (const MacroStateId& next_rhs_state : next_rhs_states) {
                         PairState next_pair{next_lhs_state, next_rhs_state};
-                        MacroStateId next_id = macro_store.intern(id, std::move(next_pair));
+                        MacroStateId next_id = macro_store.intern(node_id, std::move(next_pair));
                         next_states.push_back(next_id);
                     }
                 }
@@ -625,94 +679,99 @@ struct Context {
 
 
             case NodeKind::PreImage: {
-                PairState pair = macro_store.get_pair(id, state);
+                const PairState pair = macro_store.get_pair(node_id, state);
 
-                NodeId nfa_id = nodes[id].lhs;
-                NodeId nft_id = nodes[id].rhs;
+                const NodeId nfa_id = node.lhs;
+                const NodeId nft_id = node.rhs;
 
                 for (const mata::Symbol sync_sym : alphabets[nft_id].get_alphabet_symbols()) {
-                    std::list<MacroStateId> next_lhs_states = next_macro_states(nfa_id, pair.lhs, sync_sym);
-                    std::list<MacroStateId> next_rhs_states = next_macro_states(nft_id, pair.rhs, sync_sym, sym);
+                    const std::list<MacroStateId> next_lhs_states = next_macro_states(nfa_id, pair.lhs, sync_sym);
+                    const std::list<MacroStateId> next_rhs_states = next_macro_states(nft_id, pair.rhs, sym, sync_sym);
 
                     for (const MacroStateId& next_lhs_state : next_lhs_states) {
                         for (const MacroStateId& next_rhs_state : next_rhs_states) {
                             PairState next_pair{next_lhs_state, next_rhs_state};
-                            MacroStateId next_id = macro_store.intern(id, std::move(next_pair));
+                            MacroStateId next_id = macro_store.intern(node_id, std::move(next_pair));
                             next_states.push_back(next_id);
                         }
                     }
                 }
-
 
                 break;
             }
 
             case NodeKind::PostImage: {
-                PairState pair = macro_store.get_pair(id, state);
+                const PairState pair = macro_store.get_pair(node_id, state);
 
-                NodeId nfa_id = nodes[id].lhs;
-                NodeId nft_id = nodes[id].rhs;
+                NodeId nfa_id = node.lhs;
+                NodeId nft_id = node.rhs;
 
                 for (const mata::Symbol sync_sym : alphabets[nft_id].get_alphabet_symbols()) {
-                    std::list<MacroStateId> next_lhs_states = next_macro_states(nfa_id, pair.lhs, sync_sym);
-                    std::list<MacroStateId> next_rhs_states = next_macro_states(nft_id, pair.rhs, sym, sync_sym);
+                    const std::list<MacroStateId> next_lhs_states = next_macro_states(nfa_id, pair.lhs, sync_sym);
+                    const std::list<MacroStateId> next_rhs_states = next_macro_states(nft_id, pair.rhs, sync_sym, sym);
 
                     for (const MacroStateId& next_lhs_state : next_lhs_states) {
                         for (const MacroStateId& next_rhs_state : next_rhs_states) {
                             PairState next_pair{next_lhs_state, next_rhs_state};
-                            MacroStateId next_id = macro_store.intern(id, std::move(next_pair));
+                            MacroStateId next_id = macro_store.intern(node_id, std::move(next_pair));
                             next_states.push_back(next_id);
                         }
                     }
                 }
-
 
                 break;
             }
 
             case NodeKind::Compose: {
-                PairState pair = macro_store.get_pair(id, state);
+                const PairState pair = macro_store.get_pair(node_id, state);
 
                 for (const mata::Symbol sync_sym : alphabets[nodes[id].rhs].get_alphabet_symbols()) {
-                    std::list<MacroStateId> next_lhs = next_macro_states(nodes[id].lhs, pair.lhs, sym, sync_sym);
-                    std::list<MacroStateId> next_rhs = next_macro_states(nodes[id].rhs, pair.rhs, sync_sym, sym2);
+                    const std::list<MacroStateId> next_lhs = next_macro_states(node.lhs, pair.lhs, sym, sync_sym);
+                    const std::list<MacroStateId> next_rhs = next_macro_states(node.rhs, pair.rhs, sync_sym, sym2);
 
                     for (const MacroStateId& next_lhs_state : next_lhs) {
                         for (const MacroStateId& next_rhs_state : next_rhs) {
                             PairState next_pair{next_lhs_state, next_rhs_state};
-                            MacroStateId next_id = macro_store.intern(id, std::move(next_pair));
+                            MacroStateId next_id = macro_store.intern(node_id, std::move(next_pair));
                             next_states.push_back(next_id);
                         }
                     }
                 }
 
-
                 break;
             }
 
             case NodeKind::Complement: {
-                std::unordered_set<MacroStateId> sub_states = macro_store.get_set(id, state);
-                std::unordered_set<MacroStateId> next_sub_states = {};
+                const std::unordered_set<MacroStateId> sub_states = macro_store.get_set(node_id, state);
+                SetState next_sub_states = {};
 
-                const MacroStateId shrinked_state = macro_store.intern(id, std::move(next_sub_states));
-
-                for (const MacroStateId& sub_state : sub_states) {
-                    std::list<MacroStateId> next_sub_states_list = next_macro_states(nodes[id].lhs, sub_state, sym);
-                    if (next_sub_states_list.empty()) {
-                        // If there is no next state for one of the sub-states, then the complement will have a next
-                        // state, which is the shrinked state with empty sub-states.
-                        next_states.push_back(shrinked_state);
-                        break;
-                    } else {
-                        next_sub_states.insert(next_sub_states_list.begin(), next_sub_states_list.end());
-                    }
+                for (const MacroStateId sub_state : sub_states) {
+                    const std::list<MacroStateId> child_next_states = next_macro_states(node.lhs, sub_state, sym);
+                    next_sub_states.insert(child_next_states.begin(), child_next_states.end());
+                    // Note that if the child_next_states is empty,
+                    // it means that there is no transition on the given symbol from the sub_state,
+                    // the next_sub_states will be empty and it acts like a sink state,
+                    // which is what we want for the complement.
                 }
 
                 break;
             }
 
+            // Not sure that this can be safely merged with the complement case above, as the transition relation
+            // for NFTs is more complicated than NFAs, The only difference is that here we add the sym2 for the
+            // transition, which is default to be 0 for the normal complement case, but it can be non-zero for the
+            // complement of NFTs. Not sure if this can cause any issue, so for now we just keep them separate.
             case NodeKind::ComplementNft: {
-                // TODO
+                const SetState sub_states = macro_store.get_set(node_id, state);
+                SetState next_sub_states = {};
+
+                for (const MacroStateId sub_state : sub_states) {
+                    const std::list<MacroStateId> child_next_states = next_macro_states(node.lhs, sub_state, sym, sym2);
+                    next_sub_states.insert(child_next_states.begin(), child_next_states.end());
+                }
+
+                next_states.push_back(macro_store.intern(node_id, std::move(next_sub_states)));
+
                 break;
             }
         }
@@ -720,8 +779,8 @@ struct Context {
         return next_states;
     }
 
-    bool is_accepting(const NodeId& id, const MacroStateId& state) {
-        Node node = nodes[id];
+    bool is_accepting(const NodeId& node_id, const MacroStateId& state) {
+        Node node = nodes[node_id];
 
         switch (node.kind) {
             // For leaf nodes, we just need to check if the state is in the final states of the NFA/NFT.
@@ -737,14 +796,9 @@ struct Context {
 
             // For union, the state is accepting if the tagged state it contains is accepting.
             case NodeKind::Union: {
-                TaggedState tagged = macro_store.get_tagged(id, state);
-
-                switch (tagged.tag) {
-                    case TaggedState::Tag::Left:
-                        return is_accepting(node.lhs, tagged.state);
-                    case TaggedState::Tag::Right:
-                        return is_accepting(node.rhs, tagged.state);
-                }
+                const TaggedState tagged = macro_store.get_tagged(node_id, state);
+                return tagged.tag == TaggedState::Tag::Left ? is_accepting(node.lhs, tagged.state)
+                                                            : is_accepting(node.rhs, tagged.state);
             }
 
             // For intersection, preimage, postimage, compose, the state is accepting if both states in the pair are
@@ -753,31 +807,33 @@ struct Context {
             case NodeKind::PreImage:
             case NodeKind::PostImage:
             case NodeKind::Compose: {
-                PairState pair = macro_store.get_pair(id, state);
+                const PairState pair = macro_store.get_pair(node_id, state);
                 return is_accepting(node.lhs, pair.lhs) && is_accepting(node.rhs, pair.rhs);
             }
 
             // For complement, the state is accepting if one of the sub-states is not accepting.
             case NodeKind::Complement:
             case NodeKind::ComplementNft: {
-                std::unordered_set<MacroStateId> sub_states = macro_store.get_set(id, state);
+                const SetState sub_states = macro_store.get_set(node_id, state);
 
                 for (const MacroStateId& sub_state : sub_states) {
-                    if (!is_accepting(node.lhs, sub_state)) {
-                        return true;
+                    if (is_accepting(node.lhs, sub_state)) {
+                        return false;
                     }
                 }
-                break;
+
+                return true;
             }
         }
 
+        // Should not reach here
         return false;
     }
 
-    bool sumsumed_state(const NodeId& id, const MacroStateId& state1, const MacroStateId& state2) {
-        Node node = nodes[id];
-        State s1 = static_cast<State>(state1);
-        State s2 = static_cast<State>(state2);
+    bool subsumed_state(const NodeId node_id, const MacroStateId state1, const MacroStateId state2) {
+        const Node node = nodes[node_id];
+        const State s1 = static_cast<State>(state1);
+        const State s2 = static_cast<State>(state2);
 
         switch (node.kind) {
             case NodeKind::LeafNfa: {
@@ -791,42 +847,38 @@ struct Context {
             }
 
             case NodeKind::Union: {
-                TaggedState tagged1 = macro_store.get_tagged(id, state1);
-                TaggedState tagged2 = macro_store.get_tagged(id, state2);
+                const TaggedState tagged1 = macro_store.get_tagged(node_id, state1);
+                const TaggedState tagged2 = macro_store.get_tagged(node_id, state2);
 
                 if (tagged1.tag != tagged2.tag) {
                     // If the two states are from different sides of the union, then they are not subsumed.
                     return false;
                 }
 
-                if (tagged1.tag == TaggedState::Tag::Left) {
-                    return sumsumed_state(node.lhs, tagged1.state, tagged2.state);
-                } else {
-                    return sumsumed_state(node.rhs, tagged1.state, tagged2.state);
-                }
+                return tagged1.tag == TaggedState::Tag::Left ? subsumed_state(node.lhs, tagged1.state, tagged2.state)
+                                                             : subsumed_state(node.rhs, tagged1.state, tagged2.state);
             }
 
             case NodeKind::Intersect:
             case NodeKind::PreImage:
             case NodeKind::PostImage:
             case NodeKind::Compose: {
-                PairState pair1 = macro_store.get_pair(id, state1);
-                PairState pair2 = macro_store.get_pair(id, state2);
+                const PairState pair1 = macro_store.get_pair(node_id, state1);
+                const PairState pair2 = macro_store.get_pair(node_id, state2);
 
-                return sumsumed_state(node.lhs, pair1.lhs, pair2.lhs) && sumsumed_state(node.rhs, pair1.rhs, pair2.rhs);
+                return subsumed_state(node.lhs, pair1.lhs, pair2.lhs) && subsumed_state(node.rhs, pair1.rhs, pair2.rhs);
             }
 
             case NodeKind::Complement:
             case NodeKind::ComplementNft: {
-                std::unordered_set<MacroStateId> sub_states1 = macro_store.get_set(id, state1);
-                std::unordered_set<MacroStateId> sub_states2 = macro_store.get_set(id, state2);
+                const SetState sub_states1 = macro_store.get_set(node_id, state1);
+                const SetState sub_states2 = macro_store.get_set(node_id, state2);
 
                 for (const MacroStateId& sub_state1 : sub_states1) {
-                    // TODO
                     bool subsumed = false;
 
                     for (const MacroStateId& sub_state2 : sub_states2) {
-                        if (sumsumed_state(node.lhs, sub_state1, sub_state2)) {
+                        if (subsumed_state(node.lhs, sub_state1, sub_state2)) {
                             subsumed = true;
                             break;
                         }
@@ -846,26 +898,17 @@ struct Context {
     }
 
     bool is_subsumed(
-            const MacroStateId& state, const std::unordered_set<MacroStateId>& visited,
+            const MacroStateId state, const std::unordered_set<MacroStateId>& visited,
             const std::list<MacroStateId>& worklist) {
         for (const MacroStateId& visited_state : visited) {
-            if (visited_state == state) {
-                // If the state is already visited, then it is subsumed by itself.
-                return true;
-            }
-
-            if (sumsumed_state(root_id, state, visited_state)) {
+            // If the state is already visited, then it is subsumed by itself.
+            if (visited_state == state || subsumed_state(root_id, state, visited_state)) {
                 return true;
             }
         }
 
         for (const MacroStateId& worklist_state : worklist) {
-            if (worklist_state == state) {
-                // If the state is already in the worklist, then it is subsumed by itself.
-                return true;
-            }
-
-            if (sumsumed_state(root_id, state, worklist_state)) {
+            if (worklist_state == state || subsumed_state(root_id, state, worklist_state)) {
                 return true;
             }
         }
@@ -877,39 +920,79 @@ struct Context {
     }
 };
 
-bool SymbolicAutomataTree::is_empty(const Term& term) {
-    Context ctx(*this, term.get_id());
-
-    std::list<MacroStateId> worklist = ctx.initial_macro_states(term);
+bool is_empty_impl(Context& ctx, bool is_nft) {
+    std::list<MacroStateId> worklist = {};
     std::unordered_set<MacroStateId> visited = {};
 
-    while (worklist.size() > 0) {
-        const MacroStateId macro_id = worklist.front();
+    for (const MacroStateId& initial_state : ctx.initial_macro_states(ctx.root_id)) {
+        if (ctx.is_accepting(ctx.root_id, initial_state)) {
+            return false;
+        }
+
+        if (ctx.is_subsumed(initial_state, visited, worklist)) {
+            continue;
+        }
+
+        worklist.push_back(initial_state);
+        visited.insert(initial_state);
+    }
+
+    const auto& alphabet = ctx.alphabets[ctx.root_id];
+
+    while (!worklist.empty()) {
+        const MacroStateId& current_state = worklist.front();
         worklist.pop_front();
 
-        // NextStateIterator iter = NextStateIterator{ctx, ctx.root_id, macro_id};
-        // std::optional<MacroStateId> next_state = iter.next();
+        // This if is likely to be optimized away by the branch predictor of the CPU,
+        // as the kind of the root node is fixed, so it will always go to the same branch.
+        // not sure, need benchmark...
+        if (is_nft) {
+            for (const mata::Symbol sym : alphabet.get_alphabet_symbols()) {
+                for (const mata::Symbol sym2 : alphabet.get_alphabet_symbols()) {
+                    for (const MacroStateId& next_state :
+                         ctx.next_macro_states(ctx.root_id, current_state, sym, sym2)) {
+                        if (ctx.is_subsumed(next_state, visited, worklist)) {
+                            continue;
+                        }
 
-        // while (next_state.has_value()) {
-        //    const MacroStateId state = next_state.value();
+                        if (ctx.is_accepting(ctx.root_id, next_state)) {
+                            return false;
+                        }
 
-        // loop through symbols
-        for (const mata::Symbol sym : ctx.alphabets[ctx.root_id].get_alphabet_symbols()) {
-            for (const MacroStateId& state : ctx.next_macro_states(ctx.root_id, macro_id, sym)) {
-                // if not in visited and worklist and not subsumed, add to worklist
-                if (!ctx.is_subsumed(state, visited, worklist)) {
-                    if (ctx.is_accepting(ctx.root_id, state)) {
+                        worklist.push_back(next_state);
+                        visited.insert(next_state);
+                    }
+                }
+            }
+
+        } else {
+            for (const mata::Symbol sym : alphabet.get_alphabet_symbols()) {
+                for (const MacroStateId& next_state : ctx.next_macro_states(ctx.root_id, current_state, sym)) {
+                    if (ctx.is_subsumed(next_state, visited, worklist)) {
+                        continue;
+                    }
+
+                    if (ctx.is_accepting(ctx.root_id, next_state)) {
                         return false;
                     }
 
-                    worklist.push_back(state);
-                    visited.insert(state);
+                    worklist.push_back(next_state);
+                    visited.insert(next_state);
                 }
-
-                // next_state = iter.next();
             }
         }
     }
 
     return true;
+}
+
+
+bool SymbolicAutomataTree::is_empty(const Term& root_node) {
+    Context ctx = Context(*this, root_node.get_id());
+    return is_empty_impl(ctx, false);
+}
+
+bool SymbolicAutomataTree::is_empty(const TermNft& root_node) {
+    Context ctx = Context(*this, root_node.get_id());
+    return is_empty_impl(ctx, true);
 }
