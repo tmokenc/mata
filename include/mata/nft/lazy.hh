@@ -82,6 +82,8 @@ public:
     std::vector<nft::Nft> nfts;
     std::vector<Node> nodes;
 
+    SymbolicAutomataTree() : nfas{}, nfts{}, nodes{} {};
+
     Term make_term(const nfa::Nfa& nfa);
     TermNft make_term(const nft::Nft& nft);
     Term union_(const Term& lhs, const Term& rhs);
