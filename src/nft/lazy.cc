@@ -15,8 +15,8 @@
 #include "mata/nft/algorithms.hh"
 #include "mata/nft/types.hh"
 
-#include <bitset>
 #include <cstdlib>
+#include <limits>
 #include <list>
 #include <unordered_map>
 #include <unordered_set>
@@ -45,6 +45,10 @@ ResultSort result_sort(const NodeKind kind) {
         case NodeKind::Compose:
             return ResultSort::Nft;
     }
+
+    // Should not be reached, add here just in case we add new node kinds
+    // in the future and forget to update this function.
+    throw std::logic_error("Unknown node kind");
 }
 
 /// helper enum
@@ -53,6 +57,134 @@ enum class VisitState : uint8_t {
     Active = 1,
     Done = 2,
 };
+
+std::string symbol_name_for(mata::Alphabet* alphabet, const mata::Symbol symbol) {
+    if (alphabet != nullptr) {
+        try {
+            return alphabet->reverse_translate_symbol(symbol);
+        } catch (const std::runtime_error&) {
+            // Fall back to the raw numeric symbol when no string name is available.
+        }
+    }
+
+    return std::to_string(symbol);
+}
+
+bool try_parse_symbol_name(const std::string& symbol_name, mata::Symbol& symbol) {
+    try {
+        size_t parsed_chars = 0;
+        const unsigned long parsed_symbol = std::stoul(symbol_name, &parsed_chars, 10);
+        if (parsed_chars != symbol_name.size() || parsed_symbol > std::numeric_limits<mata::Symbol>::max()) {
+            return false;
+        }
+
+        symbol = static_cast<mata::Symbol>(parsed_symbol);
+        return true;
+    } catch (const std::exception&) { return false; }
+}
+
+bool try_translate_symbol_name(mata::Alphabet* alphabet, const std::string& symbol_name, mata::Symbol& symbol) {
+    if (alphabet != nullptr) {
+        try {
+            symbol = alphabet->translate_symb(symbol_name);
+            return true;
+        } catch (const std::runtime_error&) {
+            // Fall back to the raw numeric symbol when the named alphabet does not know the symbol.
+        }
+    }
+
+    return try_parse_symbol_name(symbol_name, symbol);
+}
+
+template<typename Automaton>
+void fill_resolved_leaf_alphabet(const Automaton& automaton, mata::OnTheFlyAlphabet& alphabet_to_fill) {
+    for (const auto& state_post : automaton.delta) {
+        for (const auto& symbol_post : state_post) {
+            alphabet_to_fill.translate_symb(symbol_name_for(automaton.alphabet, symbol_post.symbol));
+        }
+    }
+}
+
+void fill_resolved_leaf_alphabets(
+        const mata::nft::Nft& nft, mata::OnTheFlyAlphabet& alphabet_to_fill,
+        mata::OnTheFlyAlphabet& input_alphabet_to_fill, mata::OnTheFlyAlphabet& output_alphabet_to_fill) {
+    for (mata::nfa::State state = 0; state < nft.delta.num_of_states(); ++state) {
+        for (const auto& symbol_post : nft.delta.state_post(state)) {
+            const std::string symbol_name = symbol_name_for(nft.alphabet, symbol_post.symbol);
+            alphabet_to_fill.translate_symb(symbol_name);
+
+            if (nft.levels[state] == 0) {
+                input_alphabet_to_fill.translate_symb(symbol_name);
+            } else {
+                output_alphabet_to_fill.translate_symb(symbol_name);
+            }
+        }
+    }
+}
+
+template<typename Automaton>
+bool try_translate_resolved_symbol_to_local(
+        const Automaton& automaton, const mata::OnTheFlyAlphabet& resolved_alphabet, const mata::Symbol resolved_symbol,
+        mata::Symbol& local_symbol) {
+    try {
+        const std::string symbol_name = resolved_alphabet.reverse_translate_symbol(resolved_symbol);
+        return try_translate_symbol_name(automaton.alphabet, symbol_name, local_symbol);
+    } catch (const std::runtime_error&) { return false; }
+}
+
+mata::OnTheFlyAlphabet merge_alphabets(const mata::OnTheFlyAlphabet& lhs, const mata::OnTheFlyAlphabet& rhs) {
+    mata::OnTheFlyAlphabet merged{};
+
+    const auto add_symbols = [&merged](const mata::OnTheFlyAlphabet& alphabet) {
+        for (const mata::Symbol sym : alphabet.get_alphabet_symbols()) {
+            const std::string name = alphabet.reverse_translate_symbol(sym);
+            merged.translate_symb(name);
+        }
+    };
+
+    add_symbols(lhs);
+    add_symbols(rhs);
+    return merged;
+}
+
+void normalize_alphabet_vector(
+        std::vector<mata::OnTheFlyAlphabet>& alphabets, const mata::OnTheFlyAlphabet& canonical_alphabet) {
+    for (mata::OnTheFlyAlphabet& alphabet : alphabets) {
+        mata::OnTheFlyAlphabet normalized_alphabet{};
+
+        for (const mata::Symbol symbol : alphabet.get_alphabet_symbols()) {
+            const std::string symbol_name = alphabet.reverse_translate_symbol(symbol);
+            const auto canonical_it = canonical_alphabet.get_symbol_map().find(symbol_name);
+            assert(canonical_it != canonical_alphabet.get_symbol_map().end());
+            normalized_alphabet.add_new_symbol(symbol_name, canonical_it->second);
+        }
+
+        alphabet = std::move(normalized_alphabet);
+    }
+}
+
+void add_symbols_to_canonical(
+        const std::vector<mata::OnTheFlyAlphabet>& alphabets, mata::OnTheFlyAlphabet& canonical_alphabet) {
+    for (const mata::OnTheFlyAlphabet& alphabet : alphabets) {
+        for (const mata::Symbol symbol : alphabet.get_alphabet_symbols()) {
+            canonical_alphabet.translate_symb(alphabet.reverse_translate_symbol(symbol));
+        }
+    }
+}
+
+void normalize_alphabets(
+        std::vector<mata::OnTheFlyAlphabet>& alphabets, std::vector<mata::OnTheFlyAlphabet>& input_alphabets,
+        std::vector<mata::OnTheFlyAlphabet>& output_alphabets) {
+    assert(root_id < alphabets.size());
+    mata::OnTheFlyAlphabet canonical_alphabet{};
+    add_symbols_to_canonical(alphabets, canonical_alphabet);
+    add_symbols_to_canonical(input_alphabets, canonical_alphabet);
+    add_symbols_to_canonical(output_alphabets, canonical_alphabet);
+
+    normalize_alphabet_vector(alphabets, canonical_alphabet);
+    normalize_alphabet_vector(input_alphabets, canonical_alphabet);
+    normalize_alphabet_vector(output_alphabets, canonical_alphabet);
+}
 
 bool validate_node(
         const SymbolicAutomataTree& tree, const NodeId node_id, const ResultSort expected,
@@ -459,8 +591,11 @@ struct Context {
     MacroStateStore macro_store;
 
     // Resolved alphabets for each node.
-    // For leaf nodes, this is just the alphabet of the NFA/NFT.
+    // For NFA-producing nodes, this is the alphabet of the resulting language.
+    // For NFT-producing nodes, this is the union of symbols used on both tracks.
     std::vector<mata::OnTheFlyAlphabet> alphabets;
+    std::vector<mata::OnTheFlyAlphabet> input_alphabets;
+    std::vector<mata::OnTheFlyAlphabet> output_alphabets;
 
     // Precomputed simulations for each leaf node.
     // The size will be nfas.size() + nfts.size(),
@@ -472,17 +607,22 @@ struct Context {
     Context();
 
     Context(const SymbolicAutomataTree& tree, NodeId root)
-        : nfas(tree.nfas), nfts(tree.nfts), nodes{}, macro_store{}, alphabets{}, precomputed_simulations{}, root_id{0} {
+        : nfas(tree.nfas), nfts(tree.nfts), nodes{}, macro_store{}, alphabets{}, input_alphabets{}, output_alphabets{},
+          precomputed_simulations{}, root_id{0} {
+
         root_id = reconstruct_nodes(tree.nodes, root, nodes);
         macro_store = MacroStateStore(nodes);
 
         // resolve the alphabets for every reachable node,
         // also precompute the simulation on reachable base automata, which will be used for subsumption checking.
-        alphabets.reserve(nfas.size() + nfts.size());
-        precomputed_simulations.reserve(nfas.size() + nfts.size());
+        alphabets.resize(nodes.size());
+        input_alphabets.resize(nodes.size());
+        output_alphabets.resize(nodes.size());
+        precomputed_simulations.resize(nfas.size() + nfts.size());
 
         std::vector<bool> visited(nodes.size(), false);
         resolve_metadata(root_id, visited);
+        normalize_alphabets(alphabets, input_alphabets, output_alphabets);
     };
 
     // This function is used to resolve the metadata for each node,
@@ -497,32 +637,61 @@ struct Context {
         switch (node.kind) {
             case NodeKind::LeafNfa: {
                 const Nfa& nfa = nfas[node.lhs];
-                alphabets[node_id] = create_alphabet(nfa);
+                fill_resolved_leaf_alphabet(nfa, alphabets[node_id]);
                 precomputed_simulations[node.lhs] = mata::nfa::algorithms::compute_relation(nfa);
                 break;
             }
 
             case NodeKind::LeafNft: {
                 const Nft& nft = nfts[node.lhs];
-                alphabets[node_id] = create_alphabet(nft);
+                fill_resolved_leaf_alphabets(
+                        nft, alphabets[node_id], input_alphabets[node_id], output_alphabets[node_id]);
                 precomputed_simulations[node.lhs + nfas.size()] = mata::nft::algorithms::compute_relation(nft);
                 break;
             }
 
             case NodeKind::Union:
-            case NodeKind::Intersect:
-            case NodeKind::PreImage:
-            case NodeKind::PostImage:
-            case NodeKind::Compose: {
+            case NodeKind::Intersect: {
                 resolve_metadata(node.lhs, visited);
                 resolve_metadata(node.rhs, visited);
                 alphabets[node_id] = merge_alphabets(alphabets[node.lhs], alphabets[node.rhs]);
                 break;
             }
-            case NodeKind::Complement:
-            case NodeKind::ComplementNft: {
+
+            case NodeKind::Complement: {
                 resolve_metadata(node.lhs, visited);
                 alphabets[node_id] = alphabets[node.lhs];
+                break;
+            }
+
+            case NodeKind::PreImage: {
+                resolve_metadata(node.lhs, visited);
+                resolve_metadata(node.rhs, visited);
+                alphabets[node_id] = input_alphabets[node.rhs];
+                break;
+            }
+
+            case NodeKind::PostImage: {
+                resolve_metadata(node.lhs, visited);
+                resolve_metadata(node.rhs, visited);
+                alphabets[node_id] = output_alphabets[node.rhs];
+                break;
+            }
+
+            case NodeKind::ComplementNft: {
+                resolve_metadata(node.lhs, visited);
+                input_alphabets[node_id] = input_alphabets[node.lhs];
+                output_alphabets[node_id] = output_alphabets[node.lhs];
+                alphabets[node_id] = merge_alphabets(input_alphabets[node_id], output_alphabets[node_id]);
+                break;
+            }
+
+            case NodeKind::Compose: {
+                resolve_metadata(node.lhs, visited);
+                resolve_metadata(node.rhs, visited);
+                input_alphabets[node_id] = input_alphabets[node.lhs];
+                output_alphabets[node_id] = output_alphabets[node.rhs];
+                alphabets[node_id] = merge_alphabets(input_alphabets[node_id], output_alphabets[node_id]);
                 break;
             }
         }
@@ -618,26 +787,43 @@ struct Context {
     std::list<MacroStateId>
     next_macro_states(const NodeId& node_id, const MacroStateId& state, mata::Symbol sym, mata::Symbol sym2 = 0) {
         std::list<MacroStateId> next_states = {};
-        const Node& node = nodes[id];
+        const Node& node = nodes[node_id];
 
         switch (node.kind) {
             case NodeKind::LeafNfa: {
-                const Nfa nfa = nfas[node.lhs];
+                const Nfa& nfa = nfas[node.lhs];
                 const State s = static_cast<State>(state);
+                mata::Symbol local_sym = 0;
 
-                for (const State next_state : nfa.delta.get_successors(s, sym)) {
+                if (!try_translate_resolved_symbol_to_local(nfa, alphabets[node_id], sym, local_sym)) {
+                    break;
+                }
+
+                printf("LeafNfa: node_id=%u, state=%u, sym=%u\n", node_id, s, sym);
+
+                for (const State next_state : nfa.delta.get_successors(s, local_sym)) {
+                    printf("LeafNfa: adding next_state=%u\n", next_state);
                     next_states.push_back(static_cast<MacroStateId>(next_state));
                 }
+
+                printf("LeafNfa: next_states=%zu\n", next_states.size());
 
                 break;
             }
             case NodeKind::LeafNft: {
-                const Nft nft = nfts[node.lhs];
+                const Nft& nft = nfts[node.lhs];
                 const State s = static_cast<State>(state);
+                mata::Symbol local_sym = 0;
+                mata::Symbol local_sym2 = 0;
+
+                if (!try_translate_resolved_symbol_to_local(nft, input_alphabets[node_id], sym, local_sym) ||
+                    !try_translate_resolved_symbol_to_local(nft, output_alphabets[node_id], sym2, local_sym2)) {
+                    break;
+                }
 
                 // Move 2 steps in the NFT, first on sym on the input side, then on sym2 on the output side.
-                for (const State after_input : nft.delta.get_successors(s, sym)) {
-                    for (const State after_output : nft.delta.get_successors(after_input, sym2)) {
+                for (const State after_input : nft.delta.get_successors(s, local_sym)) {
+                    for (const State after_output : nft.delta.get_successors(after_input, local_sym2)) {
                         next_states.push_back(static_cast<MacroStateId>(after_output));
                     }
                 }
@@ -662,9 +848,14 @@ struct Context {
 
             case NodeKind::Intersect: {
                 const PairState pair = macro_store.get_pair(node_id, state);
+                printf("Intersect: node_id=%u, state=(%u, %u), sym=%u, sym2=%u\n", node_id, pair.lhs, pair.rhs, sym,
+                       sym2);
 
                 std::list<MacroStateId> next_lhs_states = next_macro_states(node.lhs, pair.lhs, sym, sym2);
                 std::list<MacroStateId> next_rhs_states = next_macro_states(node.rhs, pair.rhs, sym, sym2);
+
+                printf("Intersect: next_lhs_states=%zu, next_rhs_states=%zu\n", next_lhs_states.size(),
+                       next_rhs_states.size());
 
                 for (const MacroStateId& next_lhs_state : next_lhs_states) {
                     for (const MacroStateId& next_rhs_state : next_rhs_states) {
@@ -684,7 +875,7 @@ struct Context {
                 const NodeId nfa_id = node.lhs;
                 const NodeId nft_id = node.rhs;
 
-                for (const mata::Symbol sync_sym : alphabets[nft_id].get_alphabet_symbols()) {
+                for (const mata::Symbol sync_sym : output_alphabets[nft_id].get_alphabet_symbols()) {
                     const std::list<MacroStateId> next_lhs_states = next_macro_states(nfa_id, pair.lhs, sync_sym);
                     const std::list<MacroStateId> next_rhs_states = next_macro_states(nft_id, pair.rhs, sym, sync_sym);
 
@@ -703,10 +894,10 @@ struct Context {
             case NodeKind::PostImage: {
                 const PairState pair = macro_store.get_pair(node_id, state);
 
-                NodeId nfa_id = node.lhs;
-                NodeId nft_id = node.rhs;
+                const NodeId nfa_id = node.lhs;
+                const NodeId nft_id = node.rhs;
 
-                for (const mata::Symbol sync_sym : alphabets[nft_id].get_alphabet_symbols()) {
+                for (const mata::Symbol sync_sym : input_alphabets[nft_id].get_alphabet_symbols()) {
                     const std::list<MacroStateId> next_lhs_states = next_macro_states(nfa_id, pair.lhs, sync_sym);
                     const std::list<MacroStateId> next_rhs_states = next_macro_states(nft_id, pair.rhs, sync_sym, sym);
 
@@ -725,7 +916,7 @@ struct Context {
             case NodeKind::Compose: {
                 const PairState pair = macro_store.get_pair(node_id, state);
 
-                for (const mata::Symbol sync_sym : alphabets[nodes[id].rhs].get_alphabet_symbols()) {
+                for (const mata::Symbol sync_sym : output_alphabets[node.lhs].get_alphabet_symbols()) {
                     const std::list<MacroStateId> next_lhs = next_macro_states(node.lhs, pair.lhs, sym, sync_sym);
                     const std::list<MacroStateId> next_rhs = next_macro_states(node.rhs, pair.rhs, sync_sym, sym2);
 
@@ -753,6 +944,8 @@ struct Context {
                     // the next_sub_states will be empty and it acts like a sink state,
                     // which is what we want for the complement.
                 }
+
+                next_states.push_back(macro_store.intern(node_id, std::move(next_sub_states)));
 
                 break;
             }
@@ -921,6 +1114,8 @@ struct Context {
 };
 
 bool is_empty_impl(Context& ctx, bool is_nft) {
+    printf("Start emptiness checking for %s\n", is_nft ? "NFT" : "NFA");
+
     std::list<MacroStateId> worklist = {};
     std::unordered_set<MacroStateId> visited = {};
 
@@ -937,47 +1132,56 @@ bool is_empty_impl(Context& ctx, bool is_nft) {
         visited.insert(initial_state);
     }
 
+    printf("Initial worklist size: %zu\n", worklist.size());
+
     const auto& alphabet = ctx.alphabets[ctx.root_id];
+    const auto& input_alphabet = ctx.input_alphabets[ctx.root_id];
+    const auto& output_alphabet = ctx.output_alphabets[ctx.root_id];
+
+    printf("Alphabet size: %zu\n", alphabet.get_alphabet_symbols().size());
 
     while (!worklist.empty()) {
-        const MacroStateId& current_state = worklist.front();
-        worklist.pop_front();
+        const MacroStateId current_state = worklist.back(); // DFS
+        worklist.pop_back();
+        visited.insert(current_state);
 
         // This if is likely to be optimized away by the branch predictor of the CPU,
         // as the kind of the root node is fixed, so it will always go to the same branch.
         // not sure, need benchmark...
         if (is_nft) {
-            for (const mata::Symbol sym : alphabet.get_alphabet_symbols()) {
-                for (const mata::Symbol sym2 : alphabet.get_alphabet_symbols()) {
-                    for (const MacroStateId& next_state :
-                         ctx.next_macro_states(ctx.root_id, current_state, sym, sym2)) {
-                        if (ctx.is_subsumed(next_state, visited, worklist)) {
-                            continue;
-                        }
-
+            for (const mata::Symbol sym : input_alphabet.get_alphabet_symbols()) {
+                for (const mata::Symbol sym2 : output_alphabet.get_alphabet_symbols()) {
+                    auto iter = ctx.next_macro_states(ctx.root_id, current_state, sym, sym2);
+                    for (const MacroStateId& next_state : iter) {
+                        // is_accepting is cheaper than is_subsumed, so check it first
                         if (ctx.is_accepting(ctx.root_id, next_state)) {
                             return false;
                         }
 
+                        if (ctx.is_subsumed(next_state, visited, worklist)) {
+                            continue;
+                        }
+
                         worklist.push_back(next_state);
-                        visited.insert(next_state);
                     }
                 }
             }
 
         } else {
             for (const mata::Symbol sym : alphabet.get_alphabet_symbols()) {
+                printf("Current state: %u, symbol: %u\n", current_state, sym);
                 for (const MacroStateId& next_state : ctx.next_macro_states(ctx.root_id, current_state, sym)) {
-                    if (ctx.is_subsumed(next_state, visited, worklist)) {
-                        continue;
-                    }
-
+                    printf("Current state: %u, next state: %u, symbol: %u\n", current_state, next_state, sym);
+                    // is_accepting is cheaper than is_subsumed, so check it first
                     if (ctx.is_accepting(ctx.root_id, next_state)) {
                         return false;
                     }
 
+                    if (ctx.is_subsumed(next_state, visited, worklist)) {
+                        continue;
+                    }
+
                     worklist.push_back(next_state);
-                    visited.insert(next_state);
                 }
             }
         }
@@ -986,9 +1190,10 @@ bool is_empty_impl(Context& ctx, bool is_nft) {
     return true;
 }
 
-
 bool SymbolicAutomataTree::is_empty(const Term& root_node) {
+    fprintf(stderr, "Start emptiness checking for NFA\n");
     Context ctx = Context(*this, root_node.get_id());
+    fprintf(stderr, "Finish initialization for NFA, start the main loop\n");
     return is_empty_impl(ctx, false);
 }
 
