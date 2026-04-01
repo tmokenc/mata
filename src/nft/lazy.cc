@@ -1,9 +1,5 @@
 /** @file lazy.cc
  * @brief Lazy on-the-fly emptiness checking for symbolic combinations of NFAs and (2-level) NFTs.
- *
- * TODO: Coonvert into iterator-based API to make it more lazy,
- *       as the number of macro states can be very large,
- *       and we may not want to generate all of them at once.
  */
 
 #include "mata/nft/lazy.hh"
@@ -816,10 +812,7 @@ struct Context {
                     break;
                 }
 
-                printf("LeafNfa: node_id=%u, state=%zu, sym=%u\n", node_id, static_cast<size_t>(s), sym);
-
                 for (const State next_state : nfa.delta.get_successors(s, local_sym)) {
-                    printf("LeafNfa: adding next_state=%zu\n", static_cast<size_t>(next_state));
                     if (!visitor(static_cast<MacroStateId>(next_state))) {
                         return false;
                     }
@@ -870,8 +863,6 @@ struct Context {
 
             case NodeKind::Intersect: {
                 const PairState pair = macro_store.get_pair(node_id, state);
-                printf("Intersect: node_id=%u, state=(%u, %u), sym=%u, sym2=%u\n", node_id, pair.lhs, pair.rhs, sym,
-                       sym2);
 
                 if (!for_each_next_macro_state(node.lhs, pair.lhs, sym, sym2, [&](const MacroStateId next_lhs_state) {
                         return for_each_next_macro_state(
@@ -1067,6 +1058,8 @@ struct Context {
         return false;
     }
 
+    // Check if state1 is subsumed by state2,
+    // which means that the language represented by state1 is a subset of the language
     bool subsumed_state(const NodeId node_id, const MacroStateId state1, const MacroStateId state2) {
         const Node node = nodes[node_id];
         const State s1 = static_cast<State>(state1);
@@ -1108,14 +1101,16 @@ struct Context {
 
             case NodeKind::Complement:
             case NodeKind::ComplementNft: {
-                const SetState sub_states1 = macro_store.get_set(node_id, state1);
-                const SetState sub_states2 = macro_store.get_set(node_id, state2);
+                const SetState sub_states_p = macro_store.get_set(node_id, state1);
+                const SetState sub_states_s = macro_store.get_set(node_id, state2);
 
-                for (const MacroStateId& sub_state1 : sub_states1) {
+                // forall s in S exists p in P: s is subsumed by p
+                // where S is the visited macrostate and P is the new macrostate
+                for (const MacroStateId& s : sub_states_s) {
                     bool subsumed = false;
 
-                    for (const MacroStateId& sub_state2 : sub_states2) {
-                        if (subsumed_state(node.lhs, sub_state1, sub_state2)) {
+                    for (const MacroStateId& p : sub_states_p) {
+                        if (subsumed_state(node.lhs, s, p)) {
                             subsumed = true;
                             break;
                         }
@@ -1126,8 +1121,7 @@ struct Context {
                     }
                 }
 
-
-                break;
+                return true;
             }
         }
 
@@ -1135,8 +1129,7 @@ struct Context {
     }
 
     bool is_subsumed(
-            const MacroStateId state, const std::unordered_set<MacroStateId>& visited,
-            const std::list<MacroStateId>& worklist) {
+            const MacroStateId state, std::unordered_set<MacroStateId>& visited, std::list<MacroStateId>& worklist) {
         for (const MacroStateId& visited_state : visited) {
             // If the state is already visited, then it is subsumed by itself.
             if (visited_state == state || subsumed_state(root_id, state, visited_state)) {
@@ -1150,16 +1143,23 @@ struct Context {
             }
         }
 
-        // TODO maintain only the minimal states in visited and worklist, so that we can reduce the number of
-        // subsumption checks we need to do here.
+        // maintain only the minimal states in visited and worklist,
+        // so that we can reduce the number of subsumption checks we need to do.
+        // If the visited state is subsumed by the input state, then we can remove it from visited,
+        // as it will not be needed for future subsumption checks.
+        std::erase_if(visited, [&](const MacroStateId& visited_state) {
+            return subsumed_state(root_id, state, visited_state);
+        });
+
+        std::erase_if(worklist, [&](const MacroStateId& worklist_state) {
+            return subsumed_state(root_id, state, worklist_state);
+        });
 
         return false;
     }
 };
 
 bool is_empty_impl(Context& ctx, bool is_nft) {
-    printf("Start emptiness checking for %s\n", is_nft ? "NFT" : "NFA");
-
     std::list<MacroStateId> worklist = {};
     std::unordered_set<MacroStateId> visited = {};
 
@@ -1181,13 +1181,9 @@ bool is_empty_impl(Context& ctx, bool is_nft) {
         return false;
     }
 
-    printf("Initial worklist size: %zu\n", worklist.size());
-
     const auto& alphabet = ctx.alphabets[ctx.root_id];
     const auto& input_alphabet = ctx.input_alphabets[ctx.root_id];
     const auto& output_alphabet = ctx.output_alphabets[ctx.root_id];
-
-    printf("Alphabet size: %zu\n", alphabet.get_alphabet_symbols().size());
 
     while (!worklist.empty()) {
         const MacroStateId current_state = worklist.back(); // DFS
@@ -1223,10 +1219,8 @@ bool is_empty_impl(Context& ctx, bool is_nft) {
 
         } else {
             for (const mata::Symbol sym : alphabet.get_alphabet_symbols()) {
-                printf("Current state: %u, symbol: %u\n", current_state, sym);
                 const bool should_continue = ctx.for_each_next_macro_state(
                         ctx.root_id, current_state, sym, [&](const MacroStateId next_state) {
-                            printf("Current state: %u, next state: %u, symbol: %u\n", current_state, next_state, sym);
                             // is_accepting is cheaper than is_subsumed, so check it first
                             if (ctx.is_accepting(ctx.root_id, next_state)) {
                                 return false;
@@ -1251,9 +1245,7 @@ bool is_empty_impl(Context& ctx, bool is_nft) {
 }
 
 bool SymbolicAutomataTree::is_empty(const Term& root_node) {
-    fprintf(stderr, "Start emptiness checking for NFA\n");
     Context ctx = Context(*this, root_node.get_id());
-    fprintf(stderr, "Finish initialization for NFA, start the main loop\n");
     return is_empty_impl(ctx, false);
 }
 
