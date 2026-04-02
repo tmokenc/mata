@@ -1090,8 +1090,8 @@ struct Context {
 
             case NodeKind::Complement:
             case NodeKind::ComplementNft: {
-                const SetState& lhs_sub_states = macro_store.get_set(node_id, state1);
-                const SetState& rhs_sub_states = macro_store.get_set(node_id, state2);
+                const SetState& lhs_sub_states = macro_store.get_set(node_id, state2);
+                const SetState& rhs_sub_states = macro_store.get_set(node_id, state1);
 
                 for (const MacroStateId& lhs_sub_state : lhs_sub_states) {
                     bool subsumed = false;
@@ -1118,13 +1118,13 @@ struct Context {
     bool is_subsumed(
             const MacroStateId state, std::unordered_set<MacroStateId>& visited, std::list<MacroStateId>& worklist) {
         for (const MacroStateId& visited_state : visited) {
-            if (subsumed_state(root_id, visited_state, state)) {
+            if (subsumed_state(root_id, state, visited_state)) {
                 return true;
             }
         }
 
         for (const MacroStateId& worklist_state : worklist) {
-            if (subsumed_state(root_id, worklist_state, state)) {
+            if (subsumed_state(root_id, state, worklist_state)) {
                 return true;
             }
         }
