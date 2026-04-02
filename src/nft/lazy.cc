@@ -15,6 +15,8 @@
 #include <functional>
 #include <limits>
 #include <list>
+#include <memory>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -324,6 +326,7 @@ struct TaggedState {
 };
 
 using SetState = std::unordered_set<MacroStateId>;
+using AntichainBucketKey = uint64_t;
 
 uint32_t hash_states(const SetState& states) {
     uint32_t hash = 0;
@@ -337,6 +340,12 @@ uint32_t hash_states(const SetState& states) {
 uint32_t hash_pair(const PairState& pair) { return pair.lhs ^ pair.rhs; }
 
 uint32_t hash_tagged(const TaggedState& tagged) { return tagged.state ^ (static_cast<uint32_t>(tagged.tag) << 31); }
+
+AntichainBucketKey mix_bucket_key(AntichainBucketKey seed, AntichainBucketKey value) {
+    constexpr AntichainBucketKey k_mul = 0x9e3779b97f4a7c15ULL;
+    seed ^= value + k_mul + (seed << 6) + (seed >> 2);
+    return seed;
+}
 
 // TODO: optimize this
 struct MacroStateStore {
@@ -633,7 +642,6 @@ struct Context {
         input_alphabets.resize(nodes.size());
         output_alphabets.resize(nodes.size());
         precomputed_simulations.resize(nfas.size() + nfts.size());
-
         std::vector<bool> visited(nodes.size(), false);
         if (shared_alphabet != nullptr) {
             resolve_metadata(root_id, visited, shared_alphabet);
@@ -743,6 +751,220 @@ struct Context {
     // Visit initial macro states lazily. Returning false from the visitor stops
     // the traversal early and propagates to the caller.
     using MacroStateVisitor = std::function<bool(const GeneratedMacroState&)>;
+    struct NextStateIterator;
+    using NextStateIteratorPtr = std::unique_ptr<NextStateIterator>;
+
+    struct NextStateIterator {
+        Context& ctx;
+
+        explicit NextStateIterator(Context& context)
+            : ctx{context} {}
+
+        virtual ~NextStateIterator() = default;
+        virtual std::optional<GeneratedMacroState> next() = 0;
+    };
+
+    struct EmptyNextStateIterator final : NextStateIterator {
+        explicit EmptyNextStateIterator(Context& context)
+            : NextStateIterator{context} {}
+
+        std::optional<GeneratedMacroState> next() override { return std::nullopt; }
+    };
+
+    struct BufferedNextStateIterator final : NextStateIterator {
+        std::vector<GeneratedMacroState> states;
+        size_t index;
+
+        BufferedNextStateIterator(Context& context, std::vector<GeneratedMacroState> generated_states)
+            : NextStateIterator{context}, states{std::move(generated_states)}, index{0} {}
+
+        std::optional<GeneratedMacroState> next() override {
+            if (index >= states.size()) {
+                return std::nullopt;
+            }
+
+            return states[index++];
+        }
+    };
+
+    struct TaggedNextStateIterator final : NextStateIterator {
+        const NodeId parent_id;
+        const TaggedState::Tag tag;
+        NextStateIteratorPtr child_iter;
+
+        TaggedNextStateIterator(
+                Context& context, const NodeId node_id, const TaggedState::Tag child_tag,
+                NextStateIteratorPtr child_iterator)
+            : NextStateIterator{context}, parent_id{node_id}, tag{child_tag}, child_iter{std::move(child_iterator)} {}
+
+        std::optional<GeneratedMacroState> next() override {
+            const std::optional<GeneratedMacroState> child_state = child_iter->next();
+            if (!child_state.has_value()) {
+                return std::nullopt;
+            }
+
+            TaggedState tagged{child_state->id, tag};
+            const MacroStateId next_id = ctx.macro_store.intern(parent_id, std::move(tagged));
+            return GeneratedMacroState{next_id, child_state->accepting};
+        }
+    };
+
+    struct PairProductNextStateIterator final : NextStateIterator {
+        const NodeId parent_id;
+        const NodeId rhs_id;
+        const MacroStateId rhs_state;
+        const mata::Symbol rhs_sym;
+        const mata::Symbol rhs_sym2;
+        NextStateIteratorPtr lhs_iter;
+        NextStateIteratorPtr rhs_iter;
+        std::optional<GeneratedMacroState> current_lhs;
+
+        PairProductNextStateIterator(
+                Context& context, const NodeId node_id, NextStateIteratorPtr lhs_iterator, const NodeId right_node_id,
+                const MacroStateId right_state, const mata::Symbol right_sym, const mata::Symbol right_sym2)
+            : NextStateIterator{context}, parent_id{node_id}, rhs_id{right_node_id}, rhs_state{right_state},
+              rhs_sym{right_sym}, rhs_sym2{right_sym2}, lhs_iter{std::move(lhs_iterator)}, rhs_iter{},
+              current_lhs{std::nullopt} {}
+
+        std::optional<GeneratedMacroState> next() override {
+            while (true) {
+                if (current_lhs.has_value()) {
+                    if (rhs_iter == nullptr) {
+                        rhs_iter = ctx.make_next_state_iterator(rhs_id, rhs_state, rhs_sym, rhs_sym2);
+                    }
+
+                    const std::optional<GeneratedMacroState> rhs_generated = rhs_iter->next();
+                    if (rhs_generated.has_value()) {
+                        PairState next_pair{current_lhs->id, rhs_generated->id};
+                        const MacroStateId next_id = ctx.macro_store.intern(parent_id, std::move(next_pair));
+                        return GeneratedMacroState{next_id, current_lhs->accepting && rhs_generated->accepting};
+                    }
+
+                    rhs_iter.reset();
+                    current_lhs.reset();
+                    continue;
+                }
+
+                current_lhs = lhs_iter->next();
+                if (!current_lhs.has_value()) {
+                    return std::nullopt;
+                }
+            }
+        }
+    };
+
+    struct SymbolDrivenPairNextStateIterator final : NextStateIterator {
+        enum class Mode : uint8_t {
+            PreImage = 0,
+            PostImage = 1,
+            Compose = 2,
+        };
+
+        const NodeId parent_id;
+        const NodeId lhs_id;
+        const NodeId rhs_id;
+        const MacroStateId lhs_state;
+        const MacroStateId rhs_state;
+        const mata::Symbol sym;
+        const mata::Symbol sym2;
+        const std::vector<mata::Symbol> sync_symbols;
+        const Mode mode;
+        size_t next_sync_index;
+        NextStateIteratorPtr pair_iter;
+
+        SymbolDrivenPairNextStateIterator(
+                Context& context, const NodeId node_id, const NodeId left_node_id, const MacroStateId left_state,
+                const NodeId right_node_id, const MacroStateId right_state, const mata::Symbol first_sym,
+                const mata::Symbol second_sym, std::vector<mata::Symbol> symbols, const Mode iterator_mode)
+            : NextStateIterator{context}, parent_id{node_id}, lhs_id{left_node_id}, rhs_id{right_node_id},
+              lhs_state{left_state}, rhs_state{right_state}, sym{first_sym}, sym2{second_sym},
+              sync_symbols{std::move(symbols)}, mode{iterator_mode}, next_sync_index{0}, pair_iter{} {}
+
+        NextStateIteratorPtr make_pair_iterator(const mata::Symbol sync_sym) {
+            switch (mode) {
+                case Mode::PreImage: {
+                    return std::make_unique<PairProductNextStateIterator>(
+                            ctx, parent_id, ctx.make_next_state_iterator(lhs_id, lhs_state, sync_sym, 0), rhs_id,
+                            rhs_state, sym, sync_sym);
+                }
+
+                case Mode::PostImage: {
+                    return std::make_unique<PairProductNextStateIterator>(
+                            ctx, parent_id, ctx.make_next_state_iterator(lhs_id, lhs_state, sync_sym, 0), rhs_id,
+                            rhs_state, sync_sym, sym);
+                }
+
+                case Mode::Compose: {
+                    return std::make_unique<PairProductNextStateIterator>(
+                            ctx, parent_id, ctx.make_next_state_iterator(lhs_id, lhs_state, sym, sync_sym), rhs_id,
+                            rhs_state, sync_sym, sym2);
+                }
+            }
+
+            return std::make_unique<EmptyNextStateIterator>(ctx);
+        }
+
+        std::optional<GeneratedMacroState> next() override {
+            while (true) {
+                if (pair_iter != nullptr) {
+                    const std::optional<GeneratedMacroState> generated = pair_iter->next();
+                    if (generated.has_value()) {
+                        return generated;
+                    }
+                    pair_iter.reset();
+                }
+
+                if (next_sync_index >= sync_symbols.size()) {
+                    return std::nullopt;
+                }
+
+                pair_iter = make_pair_iterator(sync_symbols[next_sync_index]);
+                ++next_sync_index;
+            }
+        }
+    };
+
+    struct ComplementNextStateIterator final : NextStateIterator {
+        const NodeId parent_id;
+        const NodeId child_id;
+        const SetState& sub_states;
+        const mata::Symbol sym;
+        const mata::Symbol sym2;
+        bool emitted;
+
+        ComplementNextStateIterator(
+                Context& context, const NodeId node_id, const NodeId next_child_id, const SetState& child_states,
+                const mata::Symbol first_sym, const mata::Symbol second_sym)
+            : NextStateIterator{context}, parent_id{node_id}, child_id{next_child_id}, sub_states{child_states},
+              sym{first_sym}, sym2{second_sym}, emitted{false} {}
+
+        std::optional<GeneratedMacroState> next() override {
+            if (emitted) {
+                return std::nullopt;
+            }
+            emitted = true;
+
+            SetState next_sub_states{};
+            next_sub_states.reserve(sub_states.size());
+            bool accepting = true;
+
+            for (const MacroStateId sub_state : sub_states) {
+                NextStateIteratorPtr child_iter = ctx.make_next_state_iterator(child_id, sub_state, sym, sym2);
+                while (true) {
+                    const std::optional<GeneratedMacroState> child_next_state = child_iter->next();
+                    if (!child_next_state.has_value()) {
+                        break;
+                    }
+
+                    next_sub_states.insert(child_next_state->id);
+                    accepting = accepting && !child_next_state->accepting;
+                }
+            }
+
+            return GeneratedMacroState{
+                    ctx.macro_store.intern(parent_id, std::move(next_sub_states)), accepting};
+        }
+    };
 
     bool emit_leaf_initial_states(const Nfa& nfa, const MacroStateVisitor& visitor) {
         for (const State initial_state : nfa.initial) {
@@ -766,44 +988,6 @@ struct Context {
         }
 
         return true;
-    }
-
-    bool emit_paired_successors(
-            const NodeId parent_id, const NodeId lhs_id, const MacroStateId lhs_state, const mata::Symbol lhs_sym,
-            const mata::Symbol lhs_sym2, const NodeId rhs_id, const MacroStateId rhs_state, const mata::Symbol rhs_sym,
-            const mata::Symbol rhs_sym2, const MacroStateVisitor& visitor) {
-        return for_each_next_macro_state(
-                lhs_id, lhs_state, lhs_sym, lhs_sym2, [&](const GeneratedMacroState& next_lhs_state) {
-                    return for_each_next_macro_state(
-                            rhs_id, rhs_state, rhs_sym, rhs_sym2, [&](const GeneratedMacroState& next_rhs_state) {
-                                PairState next_pair{next_lhs_state.id, next_rhs_state.id};
-                                const MacroStateId next_id = macro_store.intern(parent_id, std::move(next_pair));
-                                return visitor(
-                                        GeneratedMacroState{
-                                                next_id, next_lhs_state.accepting && next_rhs_state.accepting});
-                            });
-                });
-    }
-
-    bool emit_complement_successor(
-            const NodeId parent_id, const NodeId child_id, const SetState& sub_states, const mata::Symbol sym,
-            const mata::Symbol sym2, const MacroStateVisitor& visitor) {
-        SetState next_sub_states{};
-        next_sub_states.reserve(sub_states.size());
-        bool accepting = true;
-
-        for (const MacroStateId sub_state : sub_states) {
-            if (!for_each_next_macro_state(
-                        child_id, sub_state, sym, sym2, [&](const GeneratedMacroState& child_next_state) {
-                            next_sub_states.insert(child_next_state.id);
-                            accepting = accepting && !child_next_state.accepting;
-                            return true;
-                        })) {
-                return false;
-            }
-        }
-
-        return visitor(GeneratedMacroState{macro_store.intern(parent_id, std::move(next_sub_states)), accepting});
     }
 
     bool for_each_initial_macro_state(const NodeId node_id, const MacroStateVisitor& visitor) {
@@ -890,153 +1074,123 @@ struct Context {
     // The sym2 is used when transducer is involved, which is the symbol on the
     // output side of the transducer. Returning false from the visitor stops
     // the traversal early and propagates to the caller.
-    bool for_each_next_macro_state(
-            const NodeId& node_id, const MacroStateId& state, mata::Symbol sym, mata::Symbol sym2,
-            const MacroStateVisitor& visitor) {
+    NextStateIteratorPtr make_next_state_iterator(
+            const NodeId node_id, const MacroStateId state, const mata::Symbol sym, const mata::Symbol sym2) {
         const Node& node = nodes[node_id];
 
         switch (node.kind) {
             case NodeKind::LeafNfa: {
                 const Nfa& nfa = nfas[node.lhs];
-                const State s = static_cast<State>(state);
+                const State source_state = static_cast<State>(state);
                 mata::Symbol local_sym = 0;
-
                 if (!try_translate_resolved_symbol_to_local(nfa, alphabets[node_id], sym, local_sym)) {
-                    break;
+                    return std::make_unique<EmptyNextStateIterator>(*this);
                 }
 
-                for (const State next_state : nfa.delta.get_successors(s, local_sym)) {
-                    if (!visitor(
-                                GeneratedMacroState{
-                                        static_cast<MacroStateId>(next_state), nfa.final.contains(next_state)})) {
-                        return false;
-                    }
+                std::vector<GeneratedMacroState> generated_states{};
+                for (const State next_state : nfa.delta.get_successors(source_state, local_sym)) {
+                    generated_states.push_back(
+                            GeneratedMacroState{
+                                    static_cast<MacroStateId>(next_state), nfa.final.contains(next_state)});
                 }
-
-                break;
+                return std::make_unique<BufferedNextStateIterator>(*this, std::move(generated_states));
             }
+
             case NodeKind::LeafNft: {
                 const Nft& nft = nfts[node.lhs];
-                const State s = static_cast<State>(state);
+                const State source_state = static_cast<State>(state);
                 mata::Symbol local_sym = 0;
                 mata::Symbol local_sym2 = 0;
-
                 if (!try_translate_resolved_symbol_to_local(nft, input_alphabets[node_id], sym, local_sym) ||
                     !try_translate_resolved_symbol_to_local(nft, output_alphabets[node_id], sym2, local_sym2)) {
-                    break;
+                    return std::make_unique<EmptyNextStateIterator>(*this);
                 }
 
-                // Move 2 steps in the NFT, first on sym on the input side, then on sym2 on the output side.
-                for (const State after_input : nft.delta.get_successors(s, local_sym)) {
+                std::vector<GeneratedMacroState> generated_states{};
+                for (const State after_input : nft.delta.get_successors(source_state, local_sym)) {
                     for (const State after_output : nft.delta.get_successors(after_input, local_sym2)) {
-                        if (!visitor(
-                                    GeneratedMacroState{
-                                            static_cast<MacroStateId>(after_output),
-                                            nft.final.contains(after_output)})) {
-                            return false;
-                        }
+                        generated_states.push_back(
+                                GeneratedMacroState{
+                                        static_cast<MacroStateId>(after_output), nft.final.contains(after_output)});
                     }
                 }
-
-                break;
+                return std::make_unique<BufferedNextStateIterator>(*this, std::move(generated_states));
             }
-
 
             case NodeKind::Union: {
                 const TaggedState tagged = macro_store.get_tagged(node_id, state);
-                const NodeId next_node_id = (tagged.tag == TaggedState::Tag::Left) ? node.lhs : node.rhs;
-
-                if (!for_each_next_macro_state(
-                            next_node_id, tagged.state, sym, sym2, [&](const GeneratedMacroState& next_state) {
-                                TaggedState next_tagged{next_state.id, tagged.tag};
-                                const MacroStateId next_id = macro_store.intern(node_id, std::move(next_tagged));
-                                return visitor(GeneratedMacroState{next_id, next_state.accepting});
-                            })) {
-                    return false;
-                }
-
-                break;
+                const NodeId child_id = (tagged.tag == TaggedState::Tag::Left) ? node.lhs : node.rhs;
+                return std::make_unique<TaggedNextStateIterator>(
+                        *this, node_id, tagged.tag, make_next_state_iterator(child_id, tagged.state, sym, sym2));
             }
-
 
             case NodeKind::Intersect: {
                 const PairState pair = macro_store.get_pair(node_id, state);
-
-                if (!emit_paired_successors(
-                            node_id, node.lhs, pair.lhs, sym, sym2, node.rhs, pair.rhs, sym, sym2, visitor)) {
-                    return false;
-                }
-
-                break;
+                return std::make_unique<PairProductNextStateIterator>(
+                        *this, node_id, make_next_state_iterator(node.lhs, pair.lhs, sym, sym2), node.rhs, pair.rhs,
+                        sym, sym2);
             }
-
 
             case NodeKind::PreImage: {
                 const PairState pair = macro_store.get_pair(node_id, state);
-
-                const NodeId nfa_id = node.lhs;
-                const NodeId nft_id = node.rhs;
-
-                for (const mata::Symbol sync_sym : output_alphabets[nft_id].get_alphabet_symbols()) {
-                    if (!emit_paired_successors(
-                                node_id, nfa_id, pair.lhs, sync_sym, 0, nft_id, pair.rhs, sym, sync_sym, visitor)) {
-                        return false;
-                    }
+                std::vector<mata::Symbol> sync_symbols{};
+                for (const mata::Symbol sync_sym : output_alphabets[node.rhs].get_alphabet_symbols()) {
+                    sync_symbols.push_back(sync_sym);
                 }
 
-                break;
+                return std::make_unique<SymbolDrivenPairNextStateIterator>(
+                        *this, node_id, node.lhs, pair.lhs, node.rhs, pair.rhs, sym, sym2, std::move(sync_symbols),
+                        SymbolDrivenPairNextStateIterator::Mode::PreImage);
             }
 
             case NodeKind::PostImage: {
                 const PairState pair = macro_store.get_pair(node_id, state);
-
-                const NodeId nfa_id = node.lhs;
-                const NodeId nft_id = node.rhs;
-
-                for (const mata::Symbol sync_sym : input_alphabets[nft_id].get_alphabet_symbols()) {
-                    if (!emit_paired_successors(
-                                node_id, nfa_id, pair.lhs, sync_sym, 0, nft_id, pair.rhs, sync_sym, sym, visitor)) {
-                        return false;
-                    }
+                std::vector<mata::Symbol> sync_symbols{};
+                for (const mata::Symbol sync_sym : input_alphabets[node.rhs].get_alphabet_symbols()) {
+                    sync_symbols.push_back(sync_sym);
                 }
 
-                break;
+                return std::make_unique<SymbolDrivenPairNextStateIterator>(
+                        *this, node_id, node.lhs, pair.lhs, node.rhs, pair.rhs, sym, sym2, std::move(sync_symbols),
+                        SymbolDrivenPairNextStateIterator::Mode::PostImage);
             }
 
             case NodeKind::Compose: {
                 const PairState pair = macro_store.get_pair(node_id, state);
-
+                std::vector<mata::Symbol> sync_symbols{};
                 for (const mata::Symbol sync_sym : output_alphabets[node.lhs].get_alphabet_symbols()) {
-                    if (!emit_paired_successors(
-                                node_id, node.lhs, pair.lhs, sym, sync_sym, node.rhs, pair.rhs, sync_sym, sym2,
-                                visitor)) {
-                        return false;
-                    }
+                    sync_symbols.push_back(sync_sym);
                 }
 
-                break;
+                return std::make_unique<SymbolDrivenPairNextStateIterator>(
+                        *this, node_id, node.lhs, pair.lhs, node.rhs, pair.rhs, sym, sym2, std::move(sync_symbols),
+                        SymbolDrivenPairNextStateIterator::Mode::Compose);
             }
 
-            case NodeKind::Complement: {
-                const SetState& sub_states = macro_store.get_set(node_id, state);
-                if (!emit_complement_successor(node_id, node.lhs, sub_states, sym, 0, visitor)) {
-                    return false;
-                }
-
-                break;
-            }
-
+            case NodeKind::Complement:
             case NodeKind::ComplementNft: {
                 const SetState& sub_states = macro_store.get_set(node_id, state);
-                if (!emit_complement_successor(node_id, node.lhs, sub_states, sym, sym2, visitor)) {
-                    return false;
-                }
-
-                break;
+                return std::make_unique<ComplementNextStateIterator>(*this, node_id, node.lhs, sub_states, sym, sym2);
             }
         }
 
-        return true;
+        return std::make_unique<EmptyNextStateIterator>(*this);
+    }
+
+    bool for_each_next_macro_state(
+            const NodeId& node_id, const MacroStateId& state, mata::Symbol sym, mata::Symbol sym2,
+            const MacroStateVisitor& visitor) {
+        NextStateIteratorPtr iter = make_next_state_iterator(node_id, state, sym, sym2);
+        while (true) {
+            const std::optional<GeneratedMacroState> next_state = iter->next();
+            if (!next_state.has_value()) {
+                return true;
+            }
+
+            if (!visitor(*next_state)) {
+                return false;
+            }
+        }
     }
 
     bool for_each_next_macro_state(
@@ -1051,7 +1205,7 @@ struct Context {
             return true;
         }
 
-        const Node node = nodes[node_id];
+        const Node& node = nodes[node_id];
         const State s1 = static_cast<State>(state1);
         const State s2 = static_cast<State>(state2);
 
@@ -1115,29 +1269,92 @@ struct Context {
         return false;
     }
 
+    AntichainBucketKey root_bucket_key(const MacroStateId state) {
+        return bucket_key(root_id, state);
+    }
+
+    AntichainBucketKey bucket_key(const NodeId node_id, const MacroStateId state) {
+        const Node& node = nodes[node_id];
+        AntichainBucketKey key = static_cast<AntichainBucketKey>(static_cast<uint8_t>(node.kind)) + 1;
+
+        switch (node.kind) {
+            case NodeKind::LeafNfa:
+            case NodeKind::LeafNft:
+                return mix_bucket_key(key, state);
+
+            case NodeKind::Union: {
+                const TaggedState tagged = macro_store.get_tagged(node_id, state);
+                const NodeId child_id = tagged.tag == TaggedState::Tag::Left ? node.lhs : node.rhs;
+                key = mix_bucket_key(key, static_cast<AntichainBucketKey>(tagged.tag));
+                return mix_bucket_key(key, bucket_key(child_id, tagged.state));
+            }
+
+            case NodeKind::Intersect:
+            case NodeKind::PreImage:
+            case NodeKind::PostImage:
+            case NodeKind::Compose: {
+                const PairState pair = macro_store.get_pair(node_id, state);
+                // Use the left component as a generic control-side projection. This keeps the
+                // partition sound and is especially effective on inclusion-shaped roots.
+                return mix_bucket_key(key, bucket_key(node.lhs, pair.lhs));
+            }
+
+            case NodeKind::Complement:
+            case NodeKind::ComplementNft: {
+                const SetState& set_state = macro_store.get_set(node_id, state);
+                key = mix_bucket_key(key, set_state.size());
+
+                if (!set_state.empty()) {
+                    key = mix_bucket_key(key, bucket_key(node.lhs, *set_state.begin()));
+                }
+
+                return key;
+            }
+        }
+
+        return key;
+    }
+
     bool is_subsumed(
-            const MacroStateId state, std::unordered_set<MacroStateId>& visited, std::list<MacroStateId>& worklist) {
-        for (const MacroStateId& visited_state : visited) {
+            const MacroStateId state, const AntichainBucketKey bucket_key, std::unordered_set<MacroStateId>& visited,
+            std::unordered_set<MacroStateId>& queued,
+            std::unordered_map<AntichainBucketKey, std::vector<MacroStateId>>& visited_buckets,
+            std::unordered_map<AntichainBucketKey, std::vector<MacroStateId>>& queued_buckets) {
+        auto& visited_bucket = visited_buckets[bucket_key];
+        for (const MacroStateId visited_state : visited_bucket) {
+            if (!visited.contains(visited_state)) {
+                continue;
+            }
+
             if (subsumed_state(root_id, state, visited_state)) {
                 return true;
             }
         }
 
-        for (const MacroStateId& worklist_state : worklist) {
-            if (subsumed_state(root_id, state, worklist_state)) {
+        auto& queued_bucket = queued_buckets[bucket_key];
+        for (const MacroStateId queued_state : queued_bucket) {
+            if (!queued.contains(queued_state)) {
+                continue;
+            }
+
+            if (subsumed_state(root_id, state, queued_state)) {
                 return true;
             }
         }
 
-        // Maintaining only minimal states in the visited and worklist sets,
-        // so we remove all states that are subsumed by the new state.
-        std::erase_if(visited, [&](const MacroStateId& visited_state) {
-            return subsumed_state(root_id, visited_state, state);
-        });
+        // Maintain only a minimal antichain within the bucket. Dominated states are invalidated
+        // lazily; stale ids stay in the bucket vectors and are skipped by the liveness checks above.
+        for (const MacroStateId visited_state : visited_bucket) {
+            if (visited.contains(visited_state) && subsumed_state(root_id, visited_state, state)) {
+                visited.erase(visited_state);
+            }
+        }
 
-        std::erase_if(worklist, [&](const MacroStateId& worklist_state) {
-            return subsumed_state(root_id, worklist_state, state);
-        });
+        for (const MacroStateId queued_state : queued_bucket) {
+            if (queued.contains(queued_state) && subsumed_state(root_id, queued_state, state)) {
+                queued.erase(queued_state);
+            }
+        }
 
         return false;
     }
@@ -1146,17 +1363,35 @@ struct Context {
 bool is_empty_impl(Context& ctx, bool is_nft) {
     std::list<MacroStateId> worklist{};
     std::unordered_set<MacroStateId> visited{};
+    std::unordered_set<MacroStateId> queued{};
+    std::unordered_map<MacroStateId, AntichainBucketKey> bucket_cache{};
+    std::unordered_map<AntichainBucketKey, std::vector<MacroStateId>> visited_buckets{};
+    std::unordered_map<AntichainBucketKey, std::vector<MacroStateId>> queued_buckets{};
+
+    const auto bucket_for = [&](const MacroStateId state) -> AntichainBucketKey {
+        const auto it = bucket_cache.find(state);
+        if (it != bucket_cache.end()) {
+            return it->second;
+        }
+
+        const AntichainBucketKey bucket = ctx.root_bucket_key(state);
+        bucket_cache.emplace(state, bucket);
+        return bucket;
+    };
 
     const auto enqueue_if_relevant = [&](const Context::GeneratedMacroState& generated_state) {
         if (generated_state.accepting) {
             return false;
         }
 
-        if (ctx.is_subsumed(generated_state.id, visited, worklist)) {
+        const AntichainBucketKey bucket = bucket_for(generated_state.id);
+        if (ctx.is_subsumed(generated_state.id, bucket, visited, queued, visited_buckets, queued_buckets)) {
             return true;
         }
 
+        queued.insert(generated_state.id);
         worklist.push_back(generated_state.id);
+        queued_buckets[bucket].push_back(generated_state.id);
         return true;
     };
 
@@ -1173,7 +1408,12 @@ bool is_empty_impl(Context& ctx, bool is_nft) {
     while (!worklist.empty()) {
         const MacroStateId current_state = worklist.back(); // DFS
         worklist.pop_back();
+        if (!queued.erase(current_state)) {
+            continue;
+        }
+
         visited.insert(current_state);
+        visited_buckets[bucket_for(current_state)].push_back(current_state);
 
         // This if is likely to be optimized away by the branch predictor of the CPU,
         // as the kind of the root node is fixed, so it will always go to the same branch.
