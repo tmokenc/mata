@@ -101,6 +101,8 @@ public:
     /// Decide emptiness of the nfa / nft represented by @p root_node.
     bool is_empty(const Term& root_node);
     bool is_empty(const TermNft& root_node);
+    bool is_empty(const Term& root_node, const OnTheFlyAlphabet& alphabet);
+    bool is_empty(const TermNft& root_node, const OnTheFlyAlphabet& alphabet);
 };
 
 
