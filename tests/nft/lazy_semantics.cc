@@ -297,6 +297,15 @@ TEST_CASE("mata::nft::lazy – complement of universal language is empty") {
     CHECK(tree.is_empty(tree.complement(tree.make_term(universal_nfa('a')))));
 }
 
+TEST_CASE("mata::nft::lazy – explicit alphabet widens complement of universal NFA") {
+    SymbolicAutomataTree tree;
+    OnTheFlyAlphabet alphabet{};
+    alphabet.add_new_symbol("a", 'a');
+    alphabet.add_new_symbol("b", 'b');
+
+    CHECK_FALSE(tree.is_empty(tree.complement(tree.make_term(universal_nfa('a'))), alphabet));
+}
+
 TEST_CASE("mata::nft::lazy – double complement of non-empty language is not empty") {
     SymbolicAutomataTree tree;
     const Term a = tree.make_term(single_symbol_nfa('a'));
@@ -496,6 +505,18 @@ TEST_CASE("mata::nft::lazy – complement of universal NFT relation is empty") {
     const TermNft univ = tree.make_term(universal_pair_loop('a', 'b'));
     CHECK_FALSE(tree.is_empty(univ));
     CHECK(tree.is_empty(tree.complement(univ)));
+}
+
+TEST_CASE("mata::nft::lazy – explicit alphabet widens complement of universal NFT relation") {
+    SymbolicAutomataTree tree;
+    const TermNft univ = tree.make_term(universal_pair_loop('a', 'b'));
+
+    OnTheFlyAlphabet alphabet{};
+    alphabet.add_new_symbol("a", 'a');
+    alphabet.add_new_symbol("b", 'b');
+    alphabet.add_new_symbol("c", 'c');
+
+    CHECK_FALSE(tree.is_empty(tree.complement(univ), alphabet));
 }
 
 TEST_CASE("mata::nft::lazy – double complement of non-empty NFT relation is not empty") {
