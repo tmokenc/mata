@@ -750,7 +750,6 @@ struct Context {
 
     // Visit initial macro states lazily. Returning false from the visitor stops
     // the traversal early and propagates to the caller.
-    using MacroStateVisitor = std::function<bool(const GeneratedMacroState&)>;
     struct NextStateIterator;
     using NextStateIteratorPtr = std::unique_ptr<NextStateIterator>;
 
@@ -965,6 +964,8 @@ struct Context {
                     ctx.macro_store.intern(parent_id, std::move(next_sub_states)), accepting};
         }
     };
+
+    using MacroStateVisitor = std::function<bool(const GeneratedMacroState&)>;
 
     bool emit_leaf_initial_states(const Nfa& nfa, const MacroStateVisitor& visitor) {
         for (const State initial_state : nfa.initial) {

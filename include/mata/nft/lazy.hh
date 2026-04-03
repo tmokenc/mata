@@ -36,12 +36,21 @@ public:
     NodeId get_id() const { return id; }
 };
 
+class TermNftUniversal : TermNft {
+    uint8_t num_of_levels;
+
+public:
+    TermNftUniversal(uint8_t num_of_levels) : TermNft(0), num_of_levels{num_of_levels} {};
+    uint8_t get_num_of_levels() const { return num_of_levels; }
+};
+
 
 enum class NodeKind : uint8_t {
     LeafNfa,
     LeafNft,
     Union,
     Intersect,
+    IntersectNft,
     Complement,
     ComplementNft,
     PreImage,
@@ -88,6 +97,7 @@ public:
     TermNft make_term(const nft::Nft& nft);
     Term union_(const Term& lhs, const Term& rhs);
     Term intersect(const Term& lhs, const Term& rhs);
+    TermNft intersect(const TermNft& lhs, const TermNft& rhs); // TODO
     Term complement(const Term& sub);
     TermNft complement(const TermNft& sub);
     Term pre_image(const Term& lang_over_output, const TermNft& transducer);
