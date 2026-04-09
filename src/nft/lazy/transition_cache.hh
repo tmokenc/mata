@@ -1,0 +1,203 @@
+/**
+ * @file transition_cache.hh
+ * @brief Private transition-cache declarations for mata::nft::lazy::detail.
+ */
+
+#pragma once
+
+#include "macrostate_store.hh"
+#include "symbols.hh"
+
+#include <algorithm>
+#include <cassert>
+#include <functional>
+#include <optional>
+#include <unordered_map>
+#include <vector>
+
+namespace mata::nft::lazy::detail {
+
+struct GeneratedMacroState {
+    MacroStateId id;
+    bool accepting;
+};
+
+using TransitionMap = std::unordered_map<SymbolTuple, std::vector<GeneratedMacroState>, SymbolTupleHash>;
+using Arity2TransitionKey = uint64_t;
+using Arity1TransitionBuilder = std::unordered_map<mata::Symbol, std::vector<GeneratedMacroState>>;
+using Arity2TransitionBuilder = std::unordered_map<Arity2TransitionKey, std::vector<GeneratedMacroState>>;
+
+template<typename Key>
+class FlatTransitionTable {
+public:
+    using value_type = std::pair<Key, std::vector<GeneratedMacroState>>;
+    using Storage = std::vector<value_type>;
+    using const_iterator = Storage::const_iterator;
+
+    FlatTransitionTable() = default;
+
+    static FlatTransitionTable freeze(std::unordered_map<Key, std::vector<GeneratedMacroState>>&& builder) {
+        Storage entries{};
+        entries.reserve(builder.size());
+        for (auto& [key, states] : builder) {
+            entries.emplace_back(key, std::move(states));
+        }
+
+        std::sort(entries.begin(), entries.end(), [](const value_type& lhs, const value_type& rhs) {
+            return lhs.first < rhs.first;
+        });
+
+        return FlatTransitionTable{std::move(entries)};
+    }
+
+    size_t size() const noexcept { return entries_.size(); }
+    bool empty() const noexcept { return entries_.empty(); }
+
+    const_iterator begin() const noexcept { return entries_.begin(); }
+    const_iterator end() const noexcept { return entries_.end(); }
+
+    const_iterator find(const Key& key) const noexcept {
+        const auto it = std::lower_bound(
+                entries_.begin(), entries_.end(), key,
+                [](const value_type& entry, const Key& target_key) { return entry.first < target_key; });
+        if (it == entries_.end() || it->first != key) {
+            return entries_.end();
+        }
+        return it;
+    }
+
+private:
+    explicit FlatTransitionTable(Storage&& entries) : entries_{std::move(entries)} {}
+
+    Storage entries_{};
+};
+
+using Arity1TransitionMap = FlatTransitionTable<mata::Symbol>;
+using Arity2TransitionMap = FlatTransitionTable<Arity2TransitionKey>;
+
+inline constexpr Arity2TransitionKey pack_arity2_symbols(
+        const mata::Symbol first, const mata::Symbol second) noexcept {
+    return (static_cast<uint64_t>(first) << 32) | static_cast<uint64_t>(second);
+}
+
+inline Arity2TransitionKey pack_arity2_tuple(const SymbolTuple& tuple) {
+    assert(tuple.size() == 2);
+    return pack_arity2_symbols(tuple[0], tuple[1]);
+}
+
+inline constexpr mata::Symbol arity2_first_symbol(const Arity2TransitionKey tuple) noexcept {
+    return static_cast<mata::Symbol>(tuple >> 32);
+}
+
+inline constexpr mata::Symbol arity2_second_symbol(const Arity2TransitionKey tuple) noexcept {
+    return static_cast<mata::Symbol>(tuple & 0xffffffffULL);
+}
+
+inline SymbolTuple unpack_arity2_tuple(const Arity2TransitionKey tuple) {
+    return SymbolTuple{arity2_first_symbol(tuple), arity2_second_symbol(tuple)};
+}
+
+// Merge duplicate generated states while OR-ing their acceptance flag.
+inline void append_generated_state(
+        std::vector<GeneratedMacroState>& states, const GeneratedMacroState& generated_state) {
+    for (GeneratedMacroState& state : states) {
+        if (state.id == generated_state.id) {
+            state.accepting = state.accepting || generated_state.accepting;
+            return;
+        }
+    }
+
+    states.push_back(generated_state);
+}
+
+struct TransitionCacheContext {
+    const std::vector<mata::nfa::Nfa>& nfas;
+    const std::vector<mata::nft::Nft>& nfts;
+    const std::vector<SyncPlan>& sync_plans;
+    const std::vector<ProjectPlan>& project_plans;
+    const std::vector<ExecNode>& nodes;
+    MacroStateStore& macro_store;
+    const std::vector<std::vector<mata::OnTheFlyAlphabet>>& level_alphabets;
+};
+
+class TransitionCache {
+public:
+    using TransitionProvider = std::function<const TransitionMap&(NodeId, MacroStateId, TransitionMap&)>;
+    using Arity1TransitionProvider =
+            std::function<const Arity1TransitionMap&(NodeId, MacroStateId, Arity1TransitionMap&)>;
+    using Arity2TransitionProvider =
+            std::function<const Arity2TransitionMap&(NodeId, MacroStateId, Arity2TransitionMap&)>;
+
+    explicit TransitionCache(const TransitionCacheContext& context);
+
+    const Arity1TransitionMap&
+    get_arity1_visible_transitions(NodeId node_id, MacroStateId state, const Arity1TransitionProvider& child_provider);
+
+    const Arity2TransitionMap& get_arity2_visible_transitions(
+            NodeId node_id, MacroStateId state, const Arity2TransitionProvider& arity2_child_provider,
+            const Arity1TransitionProvider& arity1_child_provider, const TransitionProvider& generic_child_provider);
+
+    const TransitionMap&
+    get_visible_transitions(NodeId node_id, MacroStateId state, const TransitionProvider& child_provider);
+
+private:
+    using Nfa = mata::nfa::Nfa;
+    using Nft = mata::nft::Nft;
+    using State = mata::nfa::State;
+
+    const std::vector<Nfa>& nfas;
+    const std::vector<Nft>& nfts;
+    const std::vector<SyncPlan>& sync_plans;
+    const std::vector<ProjectPlan>& project_plans;
+    const std::vector<ExecNode>& nodes;
+    MacroStateStore& macro_store;
+    const std::vector<std::vector<mata::OnTheFlyAlphabet>>& level_alphabets;
+
+    std::unordered_map<uint64_t, TransitionMap> visible_transition_cache;
+    std::unordered_map<uint64_t, Arity1TransitionMap> arity1_visible_transition_cache;
+    std::unordered_map<uint64_t, Arity2TransitionMap> arity2_visible_transition_cache;
+
+    static constexpr uint64_t state_cache_key(NodeId node_id, MacroStateId state) noexcept {
+        return (static_cast<uint64_t>(node_id) << 32) | static_cast<uint64_t>(state);
+    }
+
+    static SymbolTuple extract_levels(const SymbolTuple& tuple, const std::vector<uint8_t>& levels);
+    static std::optional<size_t> find_sync_peer(const SyncPlan& plan, LevelRef::Side side, uint8_t level);
+
+    bool is_resolved_special_symbol(
+            NodeId node_id, uint8_t level, mata::Symbol resolved_symbol, mata::Symbol special_symbol) const;
+    bool tuple_has_special_symbol_on_levels(
+            NodeId node_id, const SymbolTuple& tuple, const std::vector<uint8_t>& levels,
+            mata::Symbol special_symbol) const;
+    bool tuple_has_special_symbol(NodeId node_id, const SymbolTuple& tuple, mata::Symbol special_symbol) const;
+    bool transition_map_has_special_symbol_on_levels(
+            NodeId node_id, const TransitionMap& transitions, const std::vector<uint8_t>& levels,
+            mata::Symbol special_symbol) const;
+    bool transition_map_has_special_symbol(
+            NodeId node_id, const TransitionMap& transitions, mata::Symbol special_symbol) const;
+    bool arity2_transition_map_has_special_symbol(
+            NodeId node_id, const Arity2TransitionMap& transitions, mata::Symbol special_symbol) const;
+    bool try_merge_symbols(
+            NodeId lhs_node_id, uint8_t lhs_level, mata::Symbol lhs_symbol, NodeId rhs_node_id, uint8_t rhs_level,
+            mata::Symbol rhs_symbol, mata::Symbol& merged_symbol) const;
+    bool try_merge_tuples(
+            NodeId lhs_node_id, const SymbolTuple& lhs_tuple, NodeId rhs_node_id, const SymbolTuple& rhs_tuple,
+            SymbolTuple& merged_tuple) const;
+    bool try_merge_arity2_keys(
+            NodeId lhs_node_id, Arity2TransitionKey lhs_tuple, NodeId rhs_node_id, Arity2TransitionKey rhs_tuple,
+            Arity2TransitionKey& merged_tuple) const;
+    bool sync_levels_match(
+            NodeId lhs_node_id, const SymbolTuple& lhs_tuple, const std::vector<uint8_t>& lhs_levels,
+            NodeId rhs_node_id, const SymbolTuple& rhs_tuple, const std::vector<uint8_t>& rhs_levels) const;
+    bool build_sync_result_tuple(
+            NodeId lhs_node_id, const SymbolTuple& lhs_tuple, NodeId rhs_node_id, const SymbolTuple& rhs_tuple,
+            const SyncPlan& plan, SymbolTuple& result_tuple) const;
+    void build_leaf_nft_transitions(
+            NodeId node_id, const Nft& nft, State source_state, SymbolTuple& current_tuple, size_t next_level,
+            TransitionMap& transitions);
+    void build_leaf_arity2_nft_transitions(
+            NodeId node_id, const Nft& nft, State source_state, mata::Symbol first_symbol, mata::Symbol second_symbol,
+            size_t next_level, Arity2TransitionBuilder& transitions);
+};
+
+} // namespace mata::nft::lazy::detail

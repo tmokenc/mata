@@ -1,0 +1,161 @@
+/**
+ * @file validation.cc
+ * @brief Private structural validation helpers for mata::nft::lazy::detail.
+ */
+
+#include "validation.hh"
+
+#include "state_types.hh"
+
+#include <unordered_set>
+
+namespace mata::nft::lazy::detail {
+
+bool levels_unique(const std::vector<uint8_t>& levels) {
+    std::unordered_set<uint8_t> seen{};
+    for (const uint8_t level : levels) {
+        if (seen.contains(level)) {
+            return false;
+        }
+        seen.insert(level);
+    }
+    return true;
+}
+
+bool level_refs_unique(const std::vector<LevelRef>& refs) {
+    std::unordered_set<uint16_t> seen{};
+    for (const LevelRef ref : refs) {
+        const uint16_t packed =
+                (static_cast<uint16_t>(static_cast<uint8_t>(ref.side)) << 8) | static_cast<uint16_t>(ref.level);
+        if (seen.contains(packed)) {
+            return false;
+        }
+        seen.insert(packed);
+    }
+    return true;
+}
+
+namespace {
+
+bool validate_sync_plan(const SymbolicAutomataTree& tree, const Node& node, const SyncPlan& plan) {
+    if (plan.lhs_sync_levels.size() != plan.rhs_sync_levels.size()) {
+        return false;
+    }
+
+    const uint8_t lhs_arity = tree.nodes[node.lhs].result_arity;
+    const uint8_t rhs_arity = tree.nodes[node.rhs].result_arity;
+
+    if (!levels_unique(plan.lhs_sync_levels) || !levels_unique(plan.rhs_sync_levels) ||
+        !level_refs_unique(plan.result_layout)) {
+        return false;
+    }
+
+    for (const uint8_t level : plan.lhs_sync_levels) {
+        if (level >= lhs_arity) {
+            return false;
+        }
+    }
+
+    for (const uint8_t level : plan.rhs_sync_levels) {
+        if (level >= rhs_arity) {
+            return false;
+        }
+    }
+
+    for (const LevelRef ref : plan.result_layout) {
+        if (ref.side == LevelRef::Side::Lhs) {
+            if (ref.level >= lhs_arity) {
+                return false;
+            }
+        } else if (ref.level >= rhs_arity) {
+            return false;
+        }
+    }
+
+    return node.result_arity == plan.result_layout.size();
+}
+
+bool validate_project_plan(const SymbolicAutomataTree& tree, const Node& node, const ProjectPlan& plan) {
+    const uint8_t child_arity = tree.nodes[node.lhs].result_arity;
+    if (!levels_unique(plan.kept_levels)) {
+        return false;
+    }
+
+    for (const uint8_t level : plan.kept_levels) {
+        if (level >= child_arity) {
+            return false;
+        }
+    }
+
+    return node.result_arity == plan.kept_levels.size();
+}
+
+bool validate_node(const SymbolicAutomataTree& tree, const NodeId node_id, std::vector<VisitState>& marks) {
+    if (node_id >= tree.nodes.size()) {
+        return false;
+    }
+
+    switch (marks[node_id]) {
+        case VisitState::Unseen:
+            break;
+        case VisitState::Active:
+            return false;
+        case VisitState::Done:
+            return true;
+    }
+
+    marks[node_id] = VisitState::Active;
+    const Node& node = tree.nodes[node_id];
+    bool ok = true;
+
+    switch (node.kind) {
+        case NodeKind::LeafNfa:
+            ok = node.lhs < tree.nfas.size() && node.payload == NO_PAYLOAD && node.result_arity == 1;
+            break;
+
+        case NodeKind::LeafNft:
+            ok = node.lhs < tree.nfts.size() && node.payload == NO_PAYLOAD &&
+                 node.result_arity == tree.nfts[node.lhs].levels.num_of_levels;
+            break;
+
+        case NodeKind::Union:
+        case NodeKind::Intersect:
+            ok = node.payload == NO_PAYLOAD && validate_node(tree, node.lhs, marks) &&
+                 validate_node(tree, node.rhs, marks) &&
+                 tree.nodes[node.lhs].result_arity == tree.nodes[node.rhs].result_arity &&
+                 node.result_arity == tree.nodes[node.lhs].result_arity;
+            break;
+
+        case NodeKind::Complement:
+            ok = node.payload == NO_PAYLOAD && validate_node(tree, node.lhs, marks) &&
+                 node.result_arity == tree.nodes[node.lhs].result_arity;
+            break;
+
+        case NodeKind::Identity:
+            ok = node.payload == NO_PAYLOAD && validate_node(tree, node.lhs, marks) &&
+                 tree.nodes[node.lhs].result_arity == 1 && node.result_arity == 2;
+            break;
+
+        case NodeKind::Project:
+            ok = validate_node(tree, node.lhs, marks) && node.payload < tree.project_plans.size() &&
+                 validate_project_plan(tree, node, tree.project_plans[node.payload]);
+            break;
+
+        case NodeKind::SyncProduct:
+            ok = validate_node(tree, node.lhs, marks) && validate_node(tree, node.rhs, marks) &&
+                 node.payload < tree.sync_plans.size() && validate_sync_plan(tree, node, tree.sync_plans[node.payload]);
+            break;
+    }
+
+    marks[node_id] = ok ? VisitState::Done : VisitState::Unseen;
+    return ok;
+}
+
+} // namespace
+
+bool is_valid(const SymbolicAutomataTree& tree, const Term& root_node) {
+    std::vector<VisitState> marks(tree.nodes.size(), VisitState::Unseen);
+    return validate_node(tree, root_node.get_id(), marks);
+}
+
+} // namespace mata::nft::lazy::detail
