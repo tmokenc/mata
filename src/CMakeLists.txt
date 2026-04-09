@@ -1,12 +1,14 @@
 # create config.cc file that contains definitions of global variables (such as version, verbosity, etc.)
 configure_file ("${CMAKE_CURRENT_SOURCE_DIR}/config.cc.in" "${CMAKE_CURRENT_BINARY_DIR}/config.cc" @ONLY)
 
-# create glob all source files with .cc and .hh extensions
+# create glob all source files and private implementation headers
 file (GLOB_RECURSE MATA_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cc")
+file (GLOB_RECURSE MATA_PRIVATE_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/*.hh")
 
 # add_library(libmata SHARED
 add_library (libmata STATIC
 	${MATA_SOURCES}
+	${MATA_PRIVATE_HEADERS}
 	"${CMAKE_CURRENT_BINARY_DIR}/config.cc"
 	# we add files from the libraries here, so we create one static library libmata.a with everything and so that we can export only libmata
 	$<TARGET_OBJECTS:cudd>
