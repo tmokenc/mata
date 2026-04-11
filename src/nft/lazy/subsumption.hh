@@ -29,13 +29,9 @@ public:
     void set_nfa_simulation(size_t nfa_index, Simlib::Util::BinaryRelation relation);
     void set_nft_simulation(size_t nft_index, Simlib::Util::BinaryRelation relation);
 
-    AntichainBucketKey root_bucket_key(NodeId root_id, MacroStateId state);
-
     bool is_subsumed(
-            NodeId root_id, MacroStateId state, AntichainBucketKey bucket_key,
-            std::unordered_set<MacroStateId>& visited, std::unordered_set<MacroStateId>& queued,
-            std::unordered_map<AntichainBucketKey, std::vector<MacroStateId>>& visited_buckets,
-            std::unordered_map<AntichainBucketKey, std::vector<MacroStateId>>& queued_buckets) const;
+            NodeId root_id, MacroStateId state, std::unordered_set<MacroStateId>& visited,
+            std::unordered_set<MacroStateId>& queued) const;
 
 private:
     using State = mata::nfa::State;
@@ -46,14 +42,7 @@ private:
     const MacroStateStore& macro_store;
     std::vector<Simlib::Util::BinaryRelation> precomputed_simulations;
 
-    std::unordered_map<uint64_t, AntichainBucketKey> bucket_key_cache;
-
-    static constexpr uint64_t node_state_key(NodeId node_id, MacroStateId state) noexcept {
-        return (static_cast<uint64_t>(node_id) << 32) | static_cast<uint64_t>(state);
-    }
-
     bool subsumed_state(NodeId node_id, MacroStateId state1, MacroStateId state2) const;
-    AntichainBucketKey bucket_key(NodeId node_id, MacroStateId state);
 };
 
 } // namespace mata::nft::lazy::detail
