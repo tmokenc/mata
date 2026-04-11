@@ -220,7 +220,7 @@ const Arity2TransitionMap& TransitionCache::get_arity2_visible_transitions(
             break;
         }
 
-        case ExecKind::Arity2Identity: {
+        case ExecKind::Identity: {
             Arity1TransitionMap child_fallback{};
             const Arity1TransitionMap& child_transitions = arity1_child_provider(node.lhs, state, child_fallback);
             transitions.reserve(child_transitions.size());
@@ -419,8 +419,7 @@ const TransitionMap& TransitionCache::get_visible_transitions(
             break;
         }
 
-        case ExecKind::Identity:
-        case ExecKind::Arity2Identity: {
+        case ExecKind::Identity: {
             TransitionMap child_fallback{};
             const TransitionMap& child_transitions = child_provider(node.lhs, state, child_fallback);
             for (const auto& [tuple, child_states] : child_transitions) {

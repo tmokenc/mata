@@ -27,14 +27,22 @@ enum class ExecKind : uint8_t {
     Identity,
     Project,
     SyncProduct,
+
+    // Fast path, for now these 3 are most uses and are hottest path
+    // Not sure if the Project and SyncProduct should be added as well
+    // For my current usage (Regular Model Checking), they add very
+    // little performance gains and all the works around them not worth the trouble
+    // Also one weird case where LeafNft has arity 1, it is entire possible
+    // but really not a realistic case so I decide to not add here.
     Arity1Union,
     Arity1Intersect,
     Arity1Complement,
+
+    // Fast path for Arity 2
     Arity2LeafNft,
     Arity2Union,
     Arity2Intersect,
     Arity2Complement,
-    Arity2Identity,
     Arity2Project,
     Arity2SyncProduct,
 };
@@ -48,8 +56,7 @@ struct ExecNode {
 };
 
 constexpr bool is_complement_exec_kind(const ExecKind kind) noexcept {
-    return kind == ExecKind::Complement || kind == ExecKind::Arity1Complement ||
-           kind == ExecKind::Arity2Complement;
+    return kind == ExecKind::Complement || kind == ExecKind::Arity1Complement || kind == ExecKind::Arity2Complement;
 }
 
 constexpr bool is_arity1_exec_kind(const ExecKind kind) noexcept {
@@ -58,9 +65,8 @@ constexpr bool is_arity1_exec_kind(const ExecKind kind) noexcept {
 }
 
 constexpr bool is_arity2_exec_kind(const ExecKind kind) noexcept {
-    return kind == ExecKind::Arity2LeafNft || kind == ExecKind::Arity2Union ||
-           kind == ExecKind::Arity2Intersect || kind == ExecKind::Arity2Complement ||
-           kind == ExecKind::Arity2Identity || kind == ExecKind::Arity2Project ||
+    return kind == ExecKind::Arity2LeafNft || kind == ExecKind::Arity2Union || kind == ExecKind::Arity2Intersect ||
+           kind == ExecKind::Arity2Complement || kind == ExecKind::Identity || kind == ExecKind::Arity2Project ||
            kind == ExecKind::Arity2SyncProduct;
 }
 

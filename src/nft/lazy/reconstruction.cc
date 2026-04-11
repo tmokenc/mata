@@ -40,7 +40,7 @@ ExecKind classify_unary_kind(const NodeKind kind, const uint8_t result_arity, co
             return result_arity == 2 ? ExecKind::Arity2Complement : ExecKind::Complement;
 
         case NodeKind::Identity:
-            return result_arity == 2 ? ExecKind::Arity2Identity : ExecKind::Identity;
+            return ExecKind::Identity;
 
         case NodeKind::Project:
             return result_arity == 2 ? ExecKind::Arity2Project : ExecKind::Project;

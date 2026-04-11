@@ -99,7 +99,6 @@ MacroStateStore::MacroStateStore(
             case ExecKind::Identity:
             case ExecKind::Project:
             case ExecKind::Arity2LeafNft:
-            case ExecKind::Arity2Identity:
             case ExecKind::Arity2Project:
                 break;
         }
@@ -157,7 +156,6 @@ MacroStateStore::MacroStateStore(
 
             case ExecKind::Identity:
             case ExecKind::Project:
-            case ExecKind::Arity2Identity:
             case ExecKind::Arity2Project:
                 dense_macrostate_bounds[i] = dense_macrostate_bounds[nodes[i].lhs];
                 break;

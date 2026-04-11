@@ -118,8 +118,7 @@ namespace {
                     break;
                 }
 
-                case ExecKind::Identity:
-                case ExecKind::Arity2Identity: {
+                case ExecKind::Identity: {
                     resolve_metadata(node.lhs, visited);
                     break;
                 }
@@ -229,7 +228,6 @@ namespace {
                         break;
 
                     case ExecKind::Identity:
-                    case ExecKind::Arity2Identity:
                         unite(level_index(node_id, 0), level_index(node.lhs, 0));
                         unite(level_index(node_id, 1), level_index(node.lhs, 0));
                         unite(level_index(node_id, 0), level_index(node_id, 1));
@@ -702,7 +700,6 @@ namespace {
 
                 case ExecKind::Identity:
                 case ExecKind::Project:
-                case ExecKind::Arity2Identity:
                 case ExecKind::Arity2Project:
                     return for_each_initial_macro_state(node.lhs, visitor);
             }
@@ -815,27 +812,17 @@ bool is_empty(
     std::unordered_set<MacroStateId> queued{};
     std::unordered_set<MacroStateId> visited{};
 
-    std::unordered_map<AntichainBucketKey, std::vector<MacroStateId>> visited_buckets{};
-    std::unordered_map<AntichainBucketKey, std::vector<MacroStateId>> queued_buckets{};
-
-    const auto bucket_for = [&](const MacroStateId state) -> AntichainBucketKey {
-        return ctx.subsumption.root_bucket_key(ctx.root_id, state);
-    };
-
     const auto enqueue_if_relevant = [&](const GeneratedMacroState& generated_state) {
         if (generated_state.accepting) {
             return false;
         }
 
-        const AntichainBucketKey bucket = bucket_for(generated_state.id);
-        if (ctx.subsumption.is_subsumed(
-                    ctx.root_id, generated_state.id, bucket, visited, queued, visited_buckets, queued_buckets)) {
+        if (ctx.subsumption.is_subsumed(ctx.root_id, generated_state.id, visited, queued)) {
             return true;
         }
 
         queued.insert(generated_state.id);
         worklist.push_back(generated_state.id);
-        queued_buckets[bucket].push_back(generated_state.id);
         return true;
     };
 
@@ -853,7 +840,6 @@ bool is_empty(
             }
 
             visited.insert(current_state);
-            visited_buckets[bucket_for(current_state)].push_back(current_state);
             return current_state;
         }
 
