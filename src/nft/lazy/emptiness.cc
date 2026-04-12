@@ -59,7 +59,7 @@ namespace {
                       nfas, nfts, sync_plans, project_plans, nodes, macro_store, level_alphabets}},
               root_id{0} {
 
-            root_id = reconstruct_nodes(tree.nodes, root, nodes);
+            root_id = reconstruct_nodes(tree, root, nodes);
             macro_store = MacroStateStore(nodes, nfas, nfts);
             level_alphabets.resize(nodes.size());
 

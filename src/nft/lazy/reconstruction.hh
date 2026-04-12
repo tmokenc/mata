@@ -11,6 +11,6 @@
 
 namespace mata::nft::lazy::detail {
 
-NodeId reconstruct_nodes(const std::vector<Node>& original_nodes, NodeId id, std::vector<ExecNode>& output);
+NodeId reconstruct_nodes(const SymbolicAutomataTree& tree, NodeId id, std::vector<ExecNode>& output);
 
 } // namespace mata::nft::lazy::detail
