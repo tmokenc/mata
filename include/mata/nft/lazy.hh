@@ -81,14 +81,14 @@ struct ProjectPlan {
 struct Node {
     /// Operator kind.
     NodeKind kind;
+    /// Arity of the relation denoted by this node.
+    uint8_t result_arity;
     /// Left child or leaf index, depending on the node kind.
     NodeId lhs;
     /// Right child when present.
     NodeId rhs;
     /// Index into an auxiliary plan table when needed.
     uint32_t payload;
-    /// Arity of the relation denoted by this node.
-    uint8_t result_arity;
 };
 
 /// Builder and query interface for lazy symbolic relation trees.
