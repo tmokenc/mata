@@ -5,6 +5,7 @@
 
 #include "emptiness.hh"
 
+#include "alphabet_store.hh"
 #include "macrostate_store.hh"
 #include "reconstruction.hh"
 #include "subsumption.hh"
@@ -46,7 +47,7 @@ namespace {
 
         std::vector<ExecNode> nodes;
         MacroStateStore macro_store;
-        std::vector<std::vector<mata::OnTheFlyAlphabet>> level_alphabets;
+        AlphabetStore alphabets;
         SubsumptionEngine subsumption;
         TransitionCache transition_cache;
         NodeId root_id;
@@ -54,235 +55,63 @@ namespace {
         Context(const SymbolicAutomataTree& tree, NodeId root,
                 const std::vector<mata::OnTheFlyAlphabet>* root_level_alphabets = nullptr)
             : nfas(tree.nfas), nfts(tree.nfts), sync_plans(tree.sync_plans), project_plans(tree.project_plans), nodes{},
-              macro_store{}, level_alphabets{}, subsumption{SubsumptionContext{nfas, nfts, nodes, macro_store}},
+              macro_store{}, alphabets{}, subsumption{SubsumptionContext{nfas, nfts, nodes, macro_store}},
               transition_cache{TransitionCacheContext{
-                      nfas, nfts, sync_plans, project_plans, nodes, macro_store, level_alphabets}},
+                      nfas, nfts, sync_plans, project_plans, nodes, macro_store, alphabets}},
               root_id{0} {
 
             root_id = reconstruct_nodes(tree, root, nodes);
             macro_store = MacroStateStore(nodes, nfas, nfts);
-            level_alphabets.resize(nodes.size());
-
+            alphabets = AlphabetStore{nodes, root_id, nfas, nfts, sync_plans, project_plans, root_level_alphabets};
             std::vector<bool> visited(nodes.size(), false);
-            resolve_metadata(root_id, visited);
-
-            if (root_level_alphabets != nullptr && root_level_alphabets->size() != nodes[root_id].result_arity) {
-                throw std::invalid_argument("The number of root level alphabets must match the root arity");
-            }
-
-            canonicalize_level_alphabets(root_level_alphabets);
+            initialize_leaf_simulations(root_id, visited);
         }
 
         bool is_arity1_exec(const NodeId node_id) const noexcept {
             return is_arity1_exec_kind(nodes[node_id].kind);
         }
 
-        // Resolve per-node alphabets and leaf simulation relations bottom-up.
-        void resolve_metadata(const NodeId node_id, std::vector<bool>& visited) {
+        // Resolve leaf simulation relations bottom-up.
+        void initialize_leaf_simulations(const NodeId node_id, std::vector<bool>& visited) {
             if (visited[node_id]) {
                 return;
             }
 
             const ExecNode& node = nodes[node_id];
-            level_alphabets[node_id].resize(node.result_arity);
 
             switch (node.kind) {
-                case ExecKind::LeafNfa: {
-                    fill_resolved_leaf_alphabet(nfas[node.lhs], level_alphabets[node_id][0]);
+                case ExecKind::LeafNfa:
                     subsumption.set_nfa_simulation(node.lhs, mata::nfa::algorithms::compute_relation(nfas[node.lhs]));
                     break;
-                }
 
                 case ExecKind::LeafNft:
-                case ExecKind::Arity2LeafNft: {
-                    fill_resolved_leaf_level_alphabets(nfts[node.lhs], level_alphabets[node_id]);
+                case ExecKind::Arity2LeafNft:
                     subsumption.set_nft_simulation(node.lhs, mata::nft::algorithms::compute_relation(nfts[node.lhs]));
                     break;
-                }
 
                 case ExecKind::Union:
                 case ExecKind::Intersect:
                 case ExecKind::Arity1Union:
                 case ExecKind::Arity1Intersect:
                 case ExecKind::Arity2Union:
-                case ExecKind::Arity2Intersect: {
-                    resolve_metadata(node.lhs, visited);
-                    resolve_metadata(node.rhs, visited);
+                case ExecKind::Arity2Intersect:
+                case ExecKind::SyncProduct:
+                case ExecKind::Arity2SyncProduct:
+                    initialize_leaf_simulations(node.lhs, visited);
+                    initialize_leaf_simulations(node.rhs, visited);
                     break;
-                }
 
                 case ExecKind::Complement:
-                case ExecKind::Arity1Complement:
-                case ExecKind::Arity2Complement: {
-                    resolve_metadata(node.lhs, visited);
-                    break;
-                }
-
-                case ExecKind::Identity: {
-                    resolve_metadata(node.lhs, visited);
-                    break;
-                }
-
+                case ExecKind::Identity:
                 case ExecKind::Project:
-                case ExecKind::Arity2Project: {
-                    resolve_metadata(node.lhs, visited);
+                case ExecKind::Arity1Complement:
+                case ExecKind::Arity2Complement:
+                case ExecKind::Arity2Project:
+                    initialize_leaf_simulations(node.lhs, visited);
                     break;
-                }
-
-                case ExecKind::SyncProduct:
-                case ExecKind::Arity2SyncProduct: {
-                    resolve_metadata(node.lhs, visited);
-                    resolve_metadata(node.rhs, visited);
-                    break;
-                }
             }
 
             visited[node_id] = true;
-        }
-
-        // Canonicalize only levels that are semantically required to share symbols.
-        void canonicalize_level_alphabets(const std::vector<mata::OnTheFlyAlphabet>* root_level_alphabets) {
-            // Each node level starts with its own local alphabet. We then union together
-            // only the levels that must denote the same visible symbols:
-            // - corresponding levels of Union / Intersect
-            // - child/result levels of Complement / Project
-            // - synchronized levels of SyncProduct
-            // - both output tapes of Identity
-            //
-            // This keeps unrelated tapes independent, which is important for true
-            // per-tape alphabets.
-            std::vector<size_t> level_offsets(nodes.size() + 1, 0);
-            for (size_t node_id = 0; node_id < nodes.size(); ++node_id) {
-                level_offsets[node_id + 1] = level_offsets[node_id] + nodes[node_id].result_arity;
-            }
-
-            const size_t total_levels = level_offsets.back();
-            std::vector<size_t> parent(total_levels, 0);
-            std::vector<uint8_t> rank(total_levels, 0);
-            for (size_t i = 0; i < total_levels; ++i) {
-                parent[i] = i;
-            }
-
-            const auto level_index = [&](const NodeId node_id, const uint8_t level) {
-                return level_offsets[node_id] + level;
-            };
-
-            auto find_root = [&](size_t idx) {
-                size_t root = idx;
-                while (parent[root] != root) {
-                    root = parent[root];
-                }
-                while (parent[idx] != idx) {
-                    const size_t next = parent[idx];
-                    parent[idx] = root;
-                    idx = next;
-                }
-                return root;
-            };
-
-            auto unite = [&](const size_t lhs, const size_t rhs) {
-                size_t lhs_root = find_root(lhs);
-                size_t rhs_root = find_root(rhs);
-                if (lhs_root == rhs_root) {
-                    return;
-                }
-
-                if (rank[lhs_root] < rank[rhs_root]) {
-                    std::swap(lhs_root, rhs_root);
-                }
-
-                parent[rhs_root] = lhs_root;
-                if (rank[lhs_root] == rank[rhs_root]) {
-                    ++rank[lhs_root];
-                }
-            };
-
-            for (NodeId node_id = 0; node_id < nodes.size(); ++node_id) {
-                const ExecNode& node = nodes[node_id];
-
-                switch (node.kind) {
-                    case ExecKind::LeafNfa:
-                    case ExecKind::LeafNft:
-                    case ExecKind::Arity2LeafNft:
-                        break;
-
-                    case ExecKind::Union:
-                    case ExecKind::Intersect:
-                    case ExecKind::Arity1Union:
-                    case ExecKind::Arity1Intersect:
-                    case ExecKind::Arity2Union:
-                    case ExecKind::Arity2Intersect:
-                        for (uint8_t level = 0; level < node.result_arity; ++level) {
-                            unite(level_index(node_id, level), level_index(node.lhs, level));
-                            unite(level_index(node_id, level), level_index(node.rhs, level));
-                            unite(level_index(node.lhs, level), level_index(node.rhs, level));
-                        }
-                        break;
-
-                    case ExecKind::Complement:
-                    case ExecKind::Arity1Complement:
-                    case ExecKind::Arity2Complement:
-                        for (uint8_t level = 0; level < node.result_arity; ++level) {
-                            unite(level_index(node_id, level), level_index(node.lhs, level));
-                        }
-                        break;
-
-                    case ExecKind::Identity:
-                        unite(level_index(node_id, 0), level_index(node.lhs, 0));
-                        unite(level_index(node_id, 1), level_index(node.lhs, 0));
-                        unite(level_index(node_id, 0), level_index(node_id, 1));
-                        break;
-
-                    case ExecKind::Project:
-                    case ExecKind::Arity2Project: {
-                        const ProjectPlan& plan = project_plans[node.payload];
-                        for (uint8_t level = 0; level < node.result_arity; ++level) {
-                            unite(level_index(node_id, level), level_index(node.lhs, plan.kept_levels[level]));
-                        }
-                        break;
-                    }
-
-                    case ExecKind::SyncProduct:
-                    case ExecKind::Arity2SyncProduct: {
-                        const SyncPlan& plan = sync_plans[node.payload];
-                        for (size_t i = 0; i < plan.lhs_sync_levels.size(); ++i) {
-                            unite(level_index(node.lhs, plan.lhs_sync_levels[i]),
-                                  level_index(node.rhs, plan.rhs_sync_levels[i]));
-                        }
-
-                        for (uint8_t level = 0; level < node.result_arity; ++level) {
-                            const LevelRef ref = plan.result_layout[level];
-                            unite(level_index(node_id, level), ref.side == LevelRef::Side::Lhs
-                                                                       ? level_index(node.lhs, ref.level)
-                                                                       : level_index(node.rhs, ref.level));
-                        }
-                        break;
-                    }
-                }
-            }
-
-            std::vector<mata::OnTheFlyAlphabet> canonical_alphabets(total_levels);
-            for (NodeId node_id = 0; node_id < nodes.size(); ++node_id) {
-                for (uint8_t level = 0; level < nodes[node_id].result_arity; ++level) {
-                    add_symbols_to_canonical(
-                            level_alphabets[node_id][level],
-                            canonical_alphabets[find_root(level_index(node_id, level))]);
-                }
-            }
-
-            if (root_level_alphabets != nullptr) {
-                for (uint8_t level = 0; level < nodes[root_id].result_arity; ++level) {
-                    add_symbols_to_canonical(
-                            (*root_level_alphabets)[level],
-                            canonical_alphabets[find_root(level_index(root_id, level))]);
-                }
-            }
-
-            for (NodeId node_id = 0; node_id < nodes.size(); ++node_id) {
-                for (uint8_t level = 0; level < nodes[node_id].result_arity; ++level) {
-                    level_alphabets[node_id][level] = canonical_alphabets[find_root(level_index(node_id, level))];
-                }
-            }
         }
 
         // Use the arity-1 path when possible, otherwise materialize a generic fallback map.
@@ -418,12 +247,12 @@ namespace {
                 return enumerate_partial_tuples(node_id, partial_tuple, current_tuple, next_level + 1, visitor);
             }
 
-            for (const mata::Symbol symbol : level_alphabets[node_id][next_level].get_alphabet_symbols()) {
-                current_tuple[next_level] = symbol;
-                if (!enumerate_partial_tuples(node_id, partial_tuple, current_tuple, next_level + 1, visitor)) {
-                    return false;
+                for (const mata::Symbol symbol : alphabets.level_alphabet(node_id, static_cast<uint8_t>(next_level)).get_alphabet_symbols()) {
+                    current_tuple[next_level] = symbol;
+                    if (!enumerate_partial_tuples(node_id, partial_tuple, current_tuple, next_level + 1, visitor)) {
+                        return false;
+                    }
                 }
-            }
 
             return true;
         }
@@ -579,7 +408,7 @@ namespace {
             }
 
             if (nodes[node_id].kind == ExecKind::Arity1Complement || nodes[node_id].kind == ExecKind::Complement) {
-                for (const mata::Symbol symbol : level_alphabets[node_id][0].get_alphabet_symbols()) {
+                for (const mata::Symbol symbol : alphabets.level_alphabet(node_id, 0).get_alphabet_symbols()) {
                     if (!visitor(symbol)) {
                         return false;
                     }

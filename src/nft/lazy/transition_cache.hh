@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include "alphabet_store.hh"
 #include "macrostate_store.hh"
 #include "symbols.hh"
 
@@ -117,7 +118,7 @@ struct TransitionCacheContext {
     const std::vector<ProjectPlan>& project_plans;
     const std::vector<ExecNode>& nodes;
     MacroStateStore& macro_store;
-    const std::vector<std::vector<mata::OnTheFlyAlphabet>>& level_alphabets;
+    const AlphabetStore& alphabets;
 };
 
 class TransitionCache {
@@ -151,7 +152,7 @@ private:
     const std::vector<ProjectPlan>& project_plans;
     const std::vector<ExecNode>& nodes;
     MacroStateStore& macro_store;
-    const std::vector<std::vector<mata::OnTheFlyAlphabet>>& level_alphabets;
+    const AlphabetStore& alphabets;
 
     std::unordered_map<uint64_t, TransitionMap> visible_transition_cache;
     std::unordered_map<uint64_t, Arity1TransitionMap> arity1_visible_transition_cache;

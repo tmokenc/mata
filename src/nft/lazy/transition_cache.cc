@@ -17,14 +17,13 @@ namespace {
 template<typename TransitionMapT, typename KeyFactory>
 void append_leaf_nfa_transitions(
         const std::vector<mata::nfa::Nfa>& nfas, const std::vector<ExecNode>& nodes,
-        const std::vector<std::vector<mata::OnTheFlyAlphabet>>& level_alphabets, const NodeId node_id,
+        const AlphabetStore& alphabets, const NodeId node_id,
         const MacroStateId state, TransitionMapT& transitions, KeyFactory&& make_key) {
     const mata::nfa::Nfa& nfa = nfas[nodes[node_id].lhs];
     const mata::nfa::State source_state = static_cast<mata::nfa::State>(state);
     for (const auto& symbol_post : nfa.delta.state_post(source_state)) {
         mata::Symbol resolved_symbol = 0;
-        if (!try_translate_local_symbol_to_resolved(
-                    nfa, level_alphabets[node_id][0], symbol_post.symbol, resolved_symbol)) {
+        if (!alphabets.try_translate_local_symbol_to_resolved(nfa, node_id, 0, symbol_post.symbol, resolved_symbol)) {
             continue;
         }
 
@@ -85,7 +84,7 @@ void append_exact_intersection_transitions(
 
 TransitionCache::TransitionCache(const TransitionCacheContext& context)
     : nfas{context.nfas}, nfts{context.nfts}, sync_plans{context.sync_plans}, project_plans{context.project_plans},
-      nodes{context.nodes}, macro_store{context.macro_store}, level_alphabets{context.level_alphabets},
+      nodes{context.nodes}, macro_store{context.macro_store}, alphabets{context.alphabets},
       visible_transition_cache{}, arity1_visible_transition_cache{}, arity2_visible_transition_cache{} {}
 
 const Arity1TransitionMap& TransitionCache::get_arity1_visible_transitions(
@@ -112,7 +111,7 @@ const Arity1TransitionMap& TransitionCache::get_arity1_visible_transitions(
     switch (node.kind) {
         case ExecKind::LeafNfa:
             append_leaf_nfa_transitions(
-                    nfas, nodes, level_alphabets, node_id, state, transitions, [](mata::Symbol symbol) {
+                    nfas, nodes, alphabets, node_id, state, transitions, [](mata::Symbol symbol) {
                         return symbol;
                     });
             break;
@@ -351,7 +350,7 @@ const TransitionMap& TransitionCache::get_visible_transitions(
     switch (node.kind) {
         case ExecKind::LeafNfa:
             append_leaf_nfa_transitions(
-                    nfas, nodes, level_alphabets, node_id, state, transitions,
+                    nfas, nodes, alphabets, node_id, state, transitions,
                     [](const mata::Symbol symbol) { return SymbolTuple{symbol}; });
             break;
 
@@ -582,7 +581,7 @@ bool TransitionCache::is_resolved_special_symbol(
         const NodeId node_id, const uint8_t level, const mata::Symbol resolved_symbol,
         const mata::Symbol special_symbol) const {
     try {
-        return level_alphabets[node_id][level].reverse_translate_symbol(resolved_symbol) ==
+        return alphabets.level_alphabet(node_id, level).reverse_translate_symbol(resolved_symbol) ==
                std::to_string(special_symbol);
     } catch (const std::runtime_error&) { return false; }
 }
@@ -763,8 +762,8 @@ void TransitionCache::build_leaf_nft_transitions(
 
     for (const auto& symbol_post : nft.delta.state_post(source_state)) {
         mata::Symbol resolved_symbol = 0;
-        if (!try_translate_local_symbol_to_resolved(
-                    nft, static_cast<uint8_t>(next_level), level_alphabets[node_id][next_level], symbol_post.symbol,
+        if (!alphabets.try_translate_local_symbol_to_resolved(
+                    nft, static_cast<uint8_t>(next_level), node_id, static_cast<uint8_t>(next_level), symbol_post.symbol,
                     resolved_symbol)) {
             continue;
         }
@@ -788,8 +787,8 @@ void TransitionCache::build_leaf_arity2_nft_transitions(
 
     for (const auto& symbol_post : nft.delta.state_post(source_state)) {
         mata::Symbol resolved_symbol = 0;
-        if (!try_translate_local_symbol_to_resolved(
-                    nft, static_cast<uint8_t>(next_level), level_alphabets[node_id][next_level], symbol_post.symbol,
+        if (!alphabets.try_translate_local_symbol_to_resolved(
+                    nft, static_cast<uint8_t>(next_level), node_id, static_cast<uint8_t>(next_level), symbol_post.symbol,
                     resolved_symbol)) {
             continue;
         }
