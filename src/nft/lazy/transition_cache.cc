@@ -51,6 +51,21 @@ void append_union_transitions(
     }
 }
 
+template<typename LhsStates, typename RhsStates>
+void append_pair_product_states(
+        MacroStateStore& macro_store, const NodeId node_id, const LhsStates& lhs_states, const RhsStates& rhs_states,
+        std::vector<GeneratedMacroState>& bucket) {
+    for (const GeneratedMacroState& lhs_state : lhs_states) {
+        for (const GeneratedMacroState& rhs_state : rhs_states) {
+            append_generated_state(
+                    bucket,
+                    GeneratedMacroState{
+                            macro_store.intern(node_id, PairState{lhs_state.id, rhs_state.id}),
+                            lhs_state.accepting && rhs_state.accepting});
+        }
+    }
+}
+
 template<typename InputTransitionMapT, typename OutputTransitionMapT>
 void append_exact_intersection_transitions(
         MacroStateStore& macro_store, const NodeId node_id, const InputTransitionMapT& lhs_transitions,
@@ -68,15 +83,7 @@ void append_exact_intersection_transitions(
         const auto& lhs_states = lhs_is_smaller ? smaller_states : bigger_it->second;
         const auto& rhs_states = lhs_is_smaller ? bigger_it->second : smaller_states;
         auto& bucket = transitions[label];
-        for (const GeneratedMacroState& lhs_state : lhs_states) {
-            for (const GeneratedMacroState& rhs_state : rhs_states) {
-                append_generated_state(
-                        bucket,
-                        GeneratedMacroState{
-                                macro_store.intern(node_id, PairState{lhs_state.id, rhs_state.id}),
-                                lhs_state.accepting && rhs_state.accepting});
-            }
-        }
+        append_pair_product_states(macro_store, node_id, lhs_states, rhs_states, bucket);
     }
 }
 
@@ -205,15 +212,7 @@ const Arity2TransitionMap& TransitionCache::get_arity2_visible_transitions(
                     auto& bucket = transitions[merged_tuple];
                     const auto& lhs_states = lhs_is_smaller ? smaller_states : bigger_states;
                     const auto& rhs_states = lhs_is_smaller ? bigger_states : smaller_states;
-                    for (const GeneratedMacroState& lhs_state : lhs_states) {
-                        for (const GeneratedMacroState& rhs_state : rhs_states) {
-                            append_generated_state(
-                                    bucket,
-                                    GeneratedMacroState{
-                                            macro_store.intern(node_id, PairState{lhs_state.id, rhs_state.id}),
-                                            lhs_state.accepting && rhs_state.accepting});
-                        }
-                    }
+                    append_pair_product_states(macro_store, node_id, lhs_states, rhs_states, bucket);
                 }
             }
             break;
@@ -282,15 +281,7 @@ const Arity2TransitionMap& TransitionCache::get_arity2_visible_transitions(
                 }
 
                 auto& bucket = transitions[pack_arity2_tuple(result_tuple)];
-                for (const GeneratedMacroState& lhs_state : lhs_entry.second) {
-                    for (const GeneratedMacroState& rhs_state : rhs_entry.second) {
-                        append_generated_state(
-                                bucket,
-                                GeneratedMacroState{
-                                        macro_store.intern(node_id, PairState{lhs_state.id, rhs_state.id}),
-                                        lhs_state.accepting && rhs_state.accepting});
-                    }
-                }
+                append_pair_product_states(macro_store, node_id, lhs_entry.second, rhs_entry.second, bucket);
             };
 
             if (!needs_wildcard_matching) {
@@ -404,15 +395,7 @@ const TransitionMap& TransitionCache::get_visible_transitions(
                     }
 
                     auto& bucket = transitions[merged_tuple];
-                    for (const GeneratedMacroState& lhs_state : lhs_states) {
-                        for (const GeneratedMacroState& rhs_state : rhs_states) {
-                            append_generated_state(
-                                    bucket,
-                                    GeneratedMacroState{
-                                            macro_store.intern(node_id, PairState{lhs_state.id, rhs_state.id}),
-                                            lhs_state.accepting && rhs_state.accepting});
-                        }
-                    }
+                    append_pair_product_states(macro_store, node_id, lhs_states, rhs_states, bucket);
                 }
             }
             break;
@@ -497,15 +480,8 @@ const TransitionMap& TransitionCache::get_visible_transitions(
                         }
 
                         auto& bucket = transitions[result_tuple];
-                        for (const GeneratedMacroState& lhs_state : lhs_entry.second) {
-                            for (const GeneratedMacroState& rhs_state : rhs_entry.second) {
-                                append_generated_state(
-                                        bucket,
-                                        GeneratedMacroState{
-                                                macro_store.intern(node_id, PairState{lhs_state.id, rhs_state.id}),
-                                                lhs_state.accepting && rhs_state.accepting});
-                            }
-                        }
+                        append_pair_product_states(
+                                macro_store, node_id, lhs_entry.second, rhs_entry.second, bucket);
                     }
                 }
                 break;
@@ -526,15 +502,7 @@ const TransitionMap& TransitionCache::get_visible_transitions(
                     }
 
                     auto& bucket = transitions[result_tuple];
-                    for (const GeneratedMacroState& lhs_state : lhs_entry.second) {
-                        for (const GeneratedMacroState& rhs_state : rhs_entry.second) {
-                            append_generated_state(
-                                    bucket,
-                                    GeneratedMacroState{
-                                            macro_store.intern(node_id, PairState{lhs_state.id, rhs_state.id}),
-                                            lhs_state.accepting && rhs_state.accepting});
-                        }
-                    }
+                    append_pair_product_states(macro_store, node_id, lhs_entry.second, rhs_entry.second, bucket);
                 }
             }
             break;

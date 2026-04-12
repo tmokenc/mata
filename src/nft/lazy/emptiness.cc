@@ -37,7 +37,6 @@ namespace {
         using Nfa = mata::nfa::Nfa;
         using Nft = mata::nft::Nft;
         using State = mata::nfa::State;
-
         using MacroStateVisitor = std::function<bool(const GeneratedMacroState&)>;
 
         const std::vector<Nfa>& nfas;
@@ -56,8 +55,8 @@ namespace {
                 const std::vector<mata::OnTheFlyAlphabet>* root_level_alphabets = nullptr)
             : nfas(tree.nfas), nfts(tree.nfts), sync_plans(tree.sync_plans), project_plans(tree.project_plans), nodes{},
               macro_store{}, alphabets{}, subsumption{SubsumptionContext{nfas, nfts, nodes, macro_store}},
-              transition_cache{TransitionCacheContext{
-                      nfas, nfts, sync_plans, project_plans, nodes, macro_store, alphabets}},
+              transition_cache{
+                      TransitionCacheContext{nfas, nfts, sync_plans, project_plans, nodes, macro_store, alphabets}},
               root_id{0} {
 
             root_id = reconstruct_nodes(tree, root, nodes);
@@ -67,9 +66,7 @@ namespace {
             initialize_leaf_simulations(root_id, visited);
         }
 
-        bool is_arity1_exec(const NodeId node_id) const noexcept {
-            return is_arity1_exec_kind(nodes[node_id].kind);
-        }
+        bool is_arity1_exec(const NodeId node_id) const noexcept { return is_arity1_exec_kind(nodes[node_id].kind); }
 
         // Resolve leaf simulation relations bottom-up.
         void initialize_leaf_simulations(const NodeId node_id, std::vector<bool>& visited) {
@@ -112,38 +109,6 @@ namespace {
             }
 
             visited[node_id] = true;
-        }
-
-        // Use the arity-1 path when possible, otherwise materialize a generic fallback map.
-        const Arity1TransitionMap& get_arity1_transitions_with_fallback(
-                const NodeId node_id, const MacroStateId state, Arity1TransitionMap& fallback) {
-            if (is_complement_exec_kind(nodes[node_id].kind) || !is_arity1_exec(node_id)) {
-                fallback = build_fallback_arity1_visible_transitions(node_id, state);
-                return fallback;
-            }
-
-            return get_arity1_visible_transitions(node_id, state);
-        }
-
-        // Get cached visible transitions, falling back to on-demand materialization for complement.
-        const TransitionMap&
-        get_transitions_with_fallback(const NodeId node_id, const MacroStateId state, TransitionMap& fallback) {
-            if (is_complement_exec_kind(nodes[node_id].kind)) {
-                fallback = build_fallback_visible_transitions(node_id, state);
-                return fallback;
-            }
-
-            return get_visible_transitions(node_id, state);
-        }
-
-        const Arity2TransitionMap&
-        get_arity2_transitions_with_fallback(const NodeId node_id, const MacroStateId state, Arity2TransitionMap& fallback) {
-            if (is_complement_exec_kind(nodes[node_id].kind) || !is_arity2_exec_kind(nodes[node_id].kind)) {
-                fallback = build_fallback_arity2_visible_transitions(node_id, state);
-                return fallback;
-            }
-
-            return get_arity2_visible_transitions(node_id, state);
         }
 
         struct NextStateIterator;
@@ -247,12 +212,13 @@ namespace {
                 return enumerate_partial_tuples(node_id, partial_tuple, current_tuple, next_level + 1, visitor);
             }
 
-                for (const mata::Symbol symbol : alphabets.level_alphabet(node_id, static_cast<uint8_t>(next_level)).get_alphabet_symbols()) {
-                    current_tuple[next_level] = symbol;
-                    if (!enumerate_partial_tuples(node_id, partial_tuple, current_tuple, next_level + 1, visitor)) {
-                        return false;
-                    }
+            for (const mata::Symbol symbol :
+                 alphabets.level_alphabet(node_id, static_cast<uint8_t>(next_level)).get_alphabet_symbols()) {
+                current_tuple[next_level] = symbol;
+                if (!enumerate_partial_tuples(node_id, partial_tuple, current_tuple, next_level + 1, visitor)) {
+                    return false;
                 }
+            }
 
             return true;
         }
@@ -264,24 +230,22 @@ namespace {
             return enumerate_partial_tuples(node_id, partial_tuple, current_tuple, 0, std::forward<Visitor>(visitor));
         }
 
-        // Visit each enabled visible tuple together with its generated successors.
-        template<typename Visitor>
-        bool for_each_visible_transition(const NodeId node_id, const MacroStateId state, Visitor&& visitor) {
+        // Materialize a generic visible-transition map for nodes that do not expose one directly.
+        TransitionMap build_fallback_visible_transitions(const NodeId node_id, const MacroStateId state) {
+            TransitionMap transitions{};
             if (!is_complement_exec_kind(nodes[node_id].kind)) {
                 for (const auto& [tuple, states] : get_visible_transitions(node_id, state)) {
-                    if (!visitor(tuple, states)) {
-                        return false;
-                    }
+                    transitions.emplace(tuple, states);
                 }
-                return true;
+                return transitions;
             }
 
             // Complement cannot expose a finite transition cache in general because its
             // enabled labels come from the whole visible universe, not only from child
             // labels. Materialize it on demand through the iterator path instead.
-            return for_each_enabled_label_tuple(node_id, state, [&](const SymbolTuple& tuple) {
+            const bool fully_enumerated = for_each_enabled_label_tuple(node_id, state, [&](const SymbolTuple& tuple) {
                 std::vector<GeneratedMacroState> states{};
-                bool enumerated_all =
+                const bool enumerated_all =
                         for_each_next_macro_state(node_id, state, tuple, [&](const GeneratedMacroState& next_state) {
                             append_generated_state(states, next_state);
                             return true;
@@ -292,18 +256,12 @@ namespace {
                 if (states.empty()) {
                     return true;
                 }
-                return visitor(tuple, states);
+                transitions.emplace(tuple, std::move(states));
+                return true;
             });
-        }
-
-        // Materialize a generic visible-transition map for nodes that do not expose one directly.
-        TransitionMap build_fallback_visible_transitions(const NodeId node_id, const MacroStateId state) {
-            TransitionMap transitions{};
-            for_each_visible_transition(
-                    node_id, state, [&](const SymbolTuple& tuple, const std::vector<GeneratedMacroState>& states) {
-                        transitions.emplace(tuple, states);
-                        return true;
-                    });
+            if (!fully_enumerated) {
+                throw std::logic_error("Fallback visible-transition materialization stopped unexpectedly.");
+            }
             return transitions;
         }
 
@@ -328,37 +286,67 @@ namespace {
 
         // Cached symbol-only transitions for arity-1 nodes.
         const Arity1TransitionMap& get_arity1_visible_transitions(const NodeId node_id, const MacroStateId state) {
-            return transition_cache.get_arity1_visible_transitions(
-                    node_id, state,
-                    [&](const NodeId child_id, const MacroStateId child_state, Arity1TransitionMap& fallback)
-                            -> const Arity1TransitionMap& {
-                        return get_arity1_transitions_with_fallback(child_id, child_state, fallback);
-                    });
+            const auto arity1_child_provider = [&](const NodeId child_id, const MacroStateId child_state,
+                                                   Arity1TransitionMap& fallback) -> const Arity1TransitionMap& {
+                if (is_complement_exec_kind(nodes[child_id].kind) || !is_arity1_exec(child_id)) {
+                    fallback = build_fallback_arity1_visible_transitions(child_id, child_state);
+                    return fallback;
+                }
+
+                return get_arity1_visible_transitions(child_id, child_state);
+            };
+
+            return transition_cache.get_arity1_visible_transitions(node_id, state, arity1_child_provider);
         }
 
         // Cached visible transitions for every non-complement node kind.
         const TransitionMap& get_visible_transitions(const NodeId node_id, const MacroStateId state) {
-            return transition_cache.get_visible_transitions(
-                    node_id, state,
-                    [&](const NodeId child_id, const MacroStateId child_state,
-                        TransitionMap& fallback) -> const TransitionMap& {
-                        return get_transitions_with_fallback(child_id, child_state, fallback);
-                    });
+            const auto generic_child_provider = [&](const NodeId child_id, const MacroStateId child_state,
+                                                    TransitionMap& fallback) -> const TransitionMap& {
+                if (is_complement_exec_kind(nodes[child_id].kind)) {
+                    fallback = build_fallback_visible_transitions(child_id, child_state);
+                    return fallback;
+                }
+
+                return get_visible_transitions(child_id, child_state);
+            };
+
+            return transition_cache.get_visible_transitions(node_id, state, generic_child_provider);
         }
 
         const Arity2TransitionMap& get_arity2_visible_transitions(const NodeId node_id, const MacroStateId state) {
+            const auto arity2_child_provider = [&](const NodeId child_id, const MacroStateId child_state,
+                                                   Arity2TransitionMap& fallback) -> const Arity2TransitionMap& {
+                if (is_complement_exec_kind(nodes[child_id].kind) || !is_arity2_exec_kind(nodes[child_id].kind)) {
+                    fallback = build_fallback_arity2_visible_transitions(child_id, child_state);
+                    return fallback;
+                }
+
+                return get_arity2_visible_transitions(child_id, child_state);
+            };
+
+            const auto arity1_child_provider = [&](const NodeId child_id, const MacroStateId child_state,
+                                                   Arity1TransitionMap& fallback) -> const Arity1TransitionMap& {
+                if (is_complement_exec_kind(nodes[child_id].kind) || !is_arity1_exec(child_id)) {
+                    fallback = build_fallback_arity1_visible_transitions(child_id, child_state);
+                    return fallback;
+                }
+
+                return get_arity1_visible_transitions(child_id, child_state);
+            };
+
+            const auto generic_child_provider = [&](const NodeId child_id, const MacroStateId child_state,
+                                                    TransitionMap& fallback) -> const TransitionMap& {
+                if (is_complement_exec_kind(nodes[child_id].kind)) {
+                    fallback = build_fallback_visible_transitions(child_id, child_state);
+                    return fallback;
+                }
+
+                return get_visible_transitions(child_id, child_state);
+            };
+
             return transition_cache.get_arity2_visible_transitions(
-                    node_id, state,
-                    [&](const NodeId child_id, const MacroStateId child_state, Arity2TransitionMap& fallback)
-                            -> const Arity2TransitionMap& {
-                        return get_arity2_transitions_with_fallback(child_id, child_state, fallback);
-                    },
-                    [&](const NodeId child_id, const MacroStateId child_state, Arity1TransitionMap& fallback)
-                            -> const Arity1TransitionMap& {
-                        return get_arity1_transitions_with_fallback(child_id, child_state, fallback);
-                    },
-                    [&](const NodeId child_id, const MacroStateId child_state, TransitionMap& fallback)
-                            -> const TransitionMap& { return get_transitions_with_fallback(child_id, child_state, fallback); });
+                    node_id, state, arity2_child_provider, arity1_child_provider, generic_child_provider);
         }
 
         // Read the cached successors for one exact visible tuple.
@@ -403,9 +391,7 @@ namespace {
         // Arity-1 shortcut that enumerates only visible symbols.
         template<typename Visitor>
         bool for_each_enabled_arity1_symbol(const NodeId node_id, const MacroStateId state, Visitor&& visitor) {
-            if (nodes[node_id].result_arity != 1) {
-                throw std::logic_error("Symbol enumeration is available only for arity-1 nodes.");
-            }
+            // Assuming that the node arity is 1
 
             if (nodes[node_id].kind == ExecKind::Arity1Complement || nodes[node_id].kind == ExecKind::Complement) {
                 for (const mata::Symbol symbol : alphabets.level_alphabet(node_id, 0).get_alphabet_symbols()) {
@@ -433,9 +419,7 @@ namespace {
 
         template<typename Visitor>
         bool for_each_enabled_arity2_tuple(const NodeId node_id, const MacroStateId state, Visitor&& visitor) {
-            if (nodes[node_id].result_arity != 2) {
-                throw std::logic_error("Arity-2 tuple enumeration is available only for arity-2 nodes.");
-            }
+            // Assuming that the node arity is 2
 
             if (nodes[node_id].kind == ExecKind::Arity2Complement || nodes[node_id].kind == ExecKind::Complement) {
                 return for_each_enabled_label_tuple(node_id, state, [&](const SymbolTuple& tuple) {
@@ -550,7 +534,7 @@ namespace {
         // Visit every successor macrostate for one exact visible tuple.
         template<typename Visitor>
         bool for_each_next_macro_state(
-                const NodeId& node_id, const MacroStateId& state, const SymbolTuple& tuple, Visitor&& visitor) {
+                const NodeId node_id, const MacroStateId state, const SymbolTuple& tuple, Visitor&& visitor) {
             if (!is_complement_exec_kind(nodes[node_id].kind)) {
                 for (const GeneratedMacroState& next_state : get_next_states(node_id, state, tuple)) {
                     if (!visitor(next_state)) {
@@ -623,8 +607,6 @@ namespace {
 
             return for_each_next_macro_state(node_id, state, unpack_arity2_tuple(tuple), visitor);
         }
-
-        // Expand one root macrostate using the cheapest label representation for the root arity.
     };
 
 } // namespace
@@ -680,13 +662,11 @@ bool is_empty(
         // I don't know if there are some compiler optimizations that would make the more generic tuple-driven code path
         // just as fast, but this is simple enough and guaranteed to be fast without relying on fancy inlining.
         while (const std::optional<MacroStateId> current_state = pop_next_pending_state()) {
-            const auto process = [&](const mata::Symbol symbol) {
-                return ctx.for_each_next_macro_state_on_arity1_symbol(
-                        ctx.root_id, *current_state, symbol, enqueue_if_relevant);
-            };
-
             const bool fully_expanded =
-                    ctx.for_each_enabled_arity1_symbol(ctx.root_id, *current_state, std::move(process));
+                    ctx.for_each_enabled_arity1_symbol(ctx.root_id, *current_state, [&](const mata::Symbol symbol) {
+                        return ctx.for_each_next_macro_state_on_arity1_symbol(
+                                ctx.root_id, *current_state, symbol, enqueue_if_relevant);
+                    });
             if (!fully_expanded) {
                 return false;
             }
@@ -696,14 +676,13 @@ bool is_empty(
     }
 
     if (ctx.nodes[ctx.root_id].result_arity == 2) {
+        // Same as above, but for arity-2 roots
         while (const std::optional<MacroStateId> current_state = pop_next_pending_state()) {
-            const auto process = [&](const Arity2TransitionKey tuple) {
-                return ctx.for_each_next_macro_state_on_arity2_tuple(
-                        ctx.root_id, *current_state, tuple, enqueue_if_relevant);
-            };
-
-            const bool fully_expanded =
-                    ctx.for_each_enabled_arity2_tuple(ctx.root_id, *current_state, std::move(process));
+            const bool fully_expanded = ctx.for_each_enabled_arity2_tuple(
+                    ctx.root_id, *current_state, [&](const Arity2TransitionKey tuple) {
+                        return ctx.for_each_next_macro_state_on_arity2_tuple(
+                                ctx.root_id, *current_state, tuple, enqueue_if_relevant);
+                    });
             if (!fully_expanded) {
                 return false;
             }
@@ -713,11 +692,10 @@ bool is_empty(
     }
 
     while (const std::optional<MacroStateId> current_state = pop_next_pending_state()) {
-        const auto process = [&](const SymbolTuple& tuple) {
-            return ctx.for_each_next_macro_state(ctx.root_id, *current_state, tuple, enqueue_if_relevant);
-        };
-
-        const bool fully_expanded = ctx.for_each_enabled_label_tuple(ctx.root_id, *current_state, std::move(process));
+        const bool fully_expanded =
+                ctx.for_each_enabled_label_tuple(ctx.root_id, *current_state, [&](const SymbolTuple& tuple) {
+                    return ctx.for_each_next_macro_state(ctx.root_id, *current_state, tuple, enqueue_if_relevant);
+                });
         if (!fully_expanded) {
             return false;
         }
