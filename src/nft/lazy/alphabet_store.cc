@@ -135,7 +135,8 @@ void canonicalize_level_alphabets(
         }
     };
 
-    for (NodeId node_id = 0; node_id < nodes.size(); ++node_id) {
+    for (size_t node_index = 0; node_index < nodes.size(); ++node_index) {
+        const NodeId node_id = static_cast<NodeId>(node_index);
         const ExecNode& node = nodes[node_id];
 
         switch (node.kind) {
@@ -197,7 +198,8 @@ void canonicalize_level_alphabets(
     }
 
     std::vector<mata::OnTheFlyAlphabet> canonical_alphabets(total_levels);
-    for (NodeId node_id = 0; node_id < nodes.size(); ++node_id) {
+    for (size_t node_index = 0; node_index < nodes.size(); ++node_index) {
+        const NodeId node_id = static_cast<NodeId>(node_index);
         for (uint8_t level = 0; level < nodes[node_id].result_arity; ++level) {
             add_symbols_to_canonical(
                     level_alphabets[node_id][level], canonical_alphabets[find_root(level_index(node_id, level))]);
@@ -215,7 +217,8 @@ void canonicalize_level_alphabets(
         }
     }
 
-    for (NodeId node_id = 0; node_id < nodes.size(); ++node_id) {
+    for (size_t node_index = 0; node_index < nodes.size(); ++node_index) {
+        const NodeId node_id = static_cast<NodeId>(node_index);
         for (uint8_t level = 0; level < nodes[node_id].result_arity; ++level) {
             level_alphabets[node_id][level] = canonical_alphabets[find_root(level_index(node_id, level))];
         }

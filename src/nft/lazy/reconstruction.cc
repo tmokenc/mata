@@ -151,7 +151,8 @@ namespace {
             const std::vector<NodeId>& reorderable_nodes) {
         std::vector<ReconstructionMetrics> metrics(output.size());
 
-        for (NodeId node_id = 0; node_id < output.size(); ++node_id) {
+        for (size_t node_index = 0; node_index < output.size(); ++node_index) {
+            const NodeId node_id = static_cast<NodeId>(node_index);
             const ExecNode& node = output[node_id];
             switch (node.kind) {
                 case ExecKind::LeafNfa:
