@@ -26,6 +26,7 @@ class SubsumptionEngine {
 public:
     explicit SubsumptionEngine(const SubsumptionContext& context);
 
+    void initialize_leaf_simulations(NodeId root_id);
     void set_nfa_simulation(size_t nfa_index, Simlib::Util::BinaryRelation relation);
     void set_nft_simulation(size_t nft_index, Simlib::Util::BinaryRelation relation);
 
@@ -42,6 +43,7 @@ private:
     const MacroStateStore& macro_store;
     std::vector<Simlib::Util::BinaryRelation> precomputed_simulations;
 
+    void initialize_leaf_simulations_impl(NodeId node_id, std::vector<bool>& visited);
     bool subsumed_state(NodeId node_id, MacroStateId state1, MacroStateId state2) const;
 };
 

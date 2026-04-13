@@ -15,9 +15,6 @@
 
 #include <mata/simlib/explicit_lts.hh>
 
-#include "mata/nfa/algorithms.hh"
-#include "mata/nft/algorithms.hh"
-
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -25,7 +22,6 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -65,56 +61,12 @@ namespace {
             macro_store = MacroStateStore(nodes, nfas, nfts);
             alphabets = AlphabetStore{nodes, root_id, nfas, nfts, sync_plans, project_plans, root_level_alphabets};
             transition_resolver = make_transition_resolver(*this);
-            std::vector<bool> visited(nodes.size(), false);
-            initialize_leaf_simulations(root_id, visited);
+            subsumption.initialize_leaf_simulations(root_id);
         }
 
         bool is_arity1_exec(const NodeId node_id) const noexcept { return is_arity1_exec_kind(nodes[node_id].kind); }
 
         MacroStateStore& macro_store_ref() override { return macro_store; }
-
-        // Resolve leaf simulation relations bottom-up.
-        void initialize_leaf_simulations(const NodeId node_id, std::vector<bool>& visited) {
-            if (visited[node_id]) {
-                return;
-            }
-
-            const ExecNode& node = nodes[node_id];
-
-            switch (node.kind) {
-                case ExecKind::LeafNfa:
-                    subsumption.set_nfa_simulation(node.lhs, mata::nfa::algorithms::compute_relation(nfas[node.lhs]));
-                    break;
-
-                case ExecKind::LeafNft:
-                case ExecKind::Arity2LeafNft:
-                    subsumption.set_nft_simulation(node.lhs, mata::nft::algorithms::compute_relation(nfts[node.lhs]));
-                    break;
-
-                case ExecKind::Union:
-                case ExecKind::Intersect:
-                case ExecKind::Arity1Union:
-                case ExecKind::Arity1Intersect:
-                case ExecKind::Arity2Union:
-                case ExecKind::Arity2Intersect:
-                case ExecKind::SyncProduct:
-                case ExecKind::Arity2SyncProduct:
-                    initialize_leaf_simulations(node.lhs, visited);
-                    initialize_leaf_simulations(node.rhs, visited);
-                    break;
-
-                case ExecKind::Complement:
-                case ExecKind::Identity:
-                case ExecKind::Project:
-                case ExecKind::Arity1Complement:
-                case ExecKind::Arity2Complement:
-                case ExecKind::Arity2Project:
-                    initialize_leaf_simulations(node.lhs, visited);
-                    break;
-            }
-
-            visited[node_id] = true;
-        }
 
         // Materialize a generic visible-transition map for nodes that do not expose one directly.
         TransitionMap build_fallback_visible_transitions(const NodeId node_id, const MacroStateId state) {
@@ -145,8 +97,8 @@ namespace {
         }
 
         template<typename OutputMap, typename Builder, typename KeyFactory>
-        OutputMap build_fallback_visible_transitions_as(
-                const NodeId node_id, const MacroStateId state, KeyFactory&& make_key) {
+        OutputMap
+        build_fallback_visible_transitions_as(const NodeId node_id, const MacroStateId state, KeyFactory&& make_key) {
             Builder transitions{};
             for (const auto& [tuple, states] : build_fallback_visible_transitions(node_id, state)) {
                 transitions.emplace(make_key(tuple), states);
@@ -203,7 +155,8 @@ namespace {
             }
 
             if (nodes[node_id].kind == ExecKind::Arity1Complement || nodes[node_id].kind == ExecKind::Complement) {
-                return make_symbol_label_iterator(alphabets.level_alphabet(node_id, 0).get_alphabet_symbols().to_vector());
+                return make_symbol_label_iterator(
+                        alphabets.level_alphabet(node_id, 0).get_alphabet_symbols().to_vector());
             }
 
             if (is_arity1_exec(node_id)) {
@@ -226,8 +179,8 @@ namespace {
         }
 
         template<typename TransitionMapT, typename Key>
-        static const std::vector<GeneratedMacroState>& find_cached_next_states(
-                const TransitionMapT& transitions, const Key& key) {
+        static const std::vector<GeneratedMacroState>&
+        find_cached_next_states(const TransitionMapT& transitions, const Key& key) {
             const auto it = transitions.find(key);
             static const std::vector<GeneratedMacroState> empty_states{};
             return it == transitions.end() ? empty_states : it->second;
@@ -258,7 +211,8 @@ namespace {
                 case ExecKind::Arity1Union:
                 case ExecKind::Arity2Union: {
                     return make_union_initial_state_iterator(
-                            *this, node_id, make_initial_state_iterator(node.lhs), make_initial_state_iterator(node.rhs));
+                            *this, node_id, make_initial_state_iterator(node.lhs),
+                            make_initial_state_iterator(node.rhs));
                 }
 
                 case ExecKind::Intersect:
@@ -287,8 +241,8 @@ namespace {
         }
 
         // Build the iterator used to enumerate next states for one exact tuple.
-        NextStateIteratorPtr make_next_state_iterator(
-                const NodeId node_id, const MacroStateId state, const SymbolTuple& tuple) override {
+        NextStateIteratorPtr
+        make_next_state_iterator(const NodeId node_id, const MacroStateId state, const SymbolTuple& tuple) override {
             if (!is_complement_exec_kind(nodes[node_id].kind)) {
                 return make_buffered_next_state_iterator(*this, get_next_states(node_id, state, tuple));
             }
@@ -343,7 +297,8 @@ namespace {
         RecursiveTransitionResolverNode(Context& context, const Mode resolver_mode)
             : ctx{context}, mode{resolver_mode}, generic{}, arity1{}, arity2{} {}
 
-        const TransitionMap& resolve_visible(NodeId node_id, MacroStateId state, TransitionMap& fallback) const override {
+        const TransitionMap&
+        resolve_visible(NodeId node_id, MacroStateId state, TransitionMap& fallback) const override {
             return generic_node().resolve_visible_impl(node_id, state, fallback);
         }
 
@@ -424,7 +379,8 @@ namespace {
             arity2->arity2 = arity2;
         }
 
-        const TransitionMap& resolve_visible(NodeId node_id, MacroStateId state, TransitionMap& fallback) const override {
+        const TransitionMap&
+        resolve_visible(NodeId node_id, MacroStateId state, TransitionMap& fallback) const override {
             return generic->resolve_visible(node_id, state, fallback);
         }
 
@@ -526,7 +482,9 @@ bool is_empty(
         // I don't know if there are some compiler optimizations that would make the more generic tuple-driven code path
         // just as fast, but this is simple enough and guaranteed to be fast without relying on fancy inlining.
         return expand_worklist(
-                [&](const MacroStateId current_state) { return ctx.make_arity1_label_iterator(ctx.root_id, current_state); },
+                [&](const MacroStateId current_state) {
+                    return ctx.make_arity1_label_iterator(ctx.root_id, current_state);
+                },
                 [&](const MacroStateId current_state, const mata::Symbol symbol) {
                     return ctx.make_arity1_next_state_iterator(ctx.root_id, current_state, symbol);
                 });
@@ -535,7 +493,9 @@ bool is_empty(
     if (ctx.nodes[ctx.root_id].result_arity == 2) {
         // Same as above, but for arity-2 roots
         return expand_worklist(
-                [&](const MacroStateId current_state) { return ctx.make_arity2_label_iterator(ctx.root_id, current_state); },
+                [&](const MacroStateId current_state) {
+                    return ctx.make_arity2_label_iterator(ctx.root_id, current_state);
+                },
                 [&](const MacroStateId current_state, const Arity2TransitionKey tuple) {
                     return ctx.make_arity2_next_state_iterator(ctx.root_id, current_state, tuple);
                 });

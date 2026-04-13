@@ -5,6 +5,9 @@
 
 #include "subsumption.hh"
 
+#include "mata/nfa/algorithms.hh"
+#include "mata/nft/algorithms.hh"
+
 namespace mata::nft::lazy::detail {
 
 SubsumptionEngine::SubsumptionEngine(const SubsumptionContext& context)
@@ -17,6 +20,53 @@ void SubsumptionEngine::set_nfa_simulation(const size_t nfa_index, Simlib::Util:
 
 void SubsumptionEngine::set_nft_simulation(const size_t nft_index, Simlib::Util::BinaryRelation relation) {
     precomputed_simulations[nfas.size() + nft_index] = std::move(relation);
+}
+
+void SubsumptionEngine::initialize_leaf_simulations(const NodeId root_id) {
+    std::vector<bool> visited(nodes.size(), false);
+    initialize_leaf_simulations_impl(root_id, visited);
+}
+
+void SubsumptionEngine::initialize_leaf_simulations_impl(const NodeId node_id, std::vector<bool>& visited) {
+    if (visited[node_id]) {
+        return;
+    }
+
+    const ExecNode& node = nodes[node_id];
+
+    switch (node.kind) {
+        case ExecKind::LeafNfa:
+            set_nfa_simulation(node.lhs, mata::nfa::algorithms::compute_relation(nfas[node.lhs]));
+            break;
+
+        case ExecKind::LeafNft:
+        case ExecKind::Arity2LeafNft:
+            set_nft_simulation(node.lhs, mata::nft::algorithms::compute_relation(nfts[node.lhs]));
+            break;
+
+        case ExecKind::Union:
+        case ExecKind::Intersect:
+        case ExecKind::Arity1Union:
+        case ExecKind::Arity1Intersect:
+        case ExecKind::Arity2Union:
+        case ExecKind::Arity2Intersect:
+        case ExecKind::SyncProduct:
+        case ExecKind::Arity2SyncProduct:
+            initialize_leaf_simulations_impl(node.lhs, visited);
+            initialize_leaf_simulations_impl(node.rhs, visited);
+            break;
+
+        case ExecKind::Complement:
+        case ExecKind::Identity:
+        case ExecKind::Project:
+        case ExecKind::Arity1Complement:
+        case ExecKind::Arity2Complement:
+        case ExecKind::Arity2Project:
+            initialize_leaf_simulations_impl(node.lhs, visited);
+            break;
+    }
+
+    visited[node_id] = true;
 }
 
 bool SubsumptionEngine::subsumed_state(
