@@ -12,13 +12,17 @@
 
 namespace mata::nft::lazy::detail {
 
+/// DFS visitation state used during lazy DAG traversals.
 enum class VisitState : uint8_t {
     Unseen = 0,
     Active = 1,
     Done = 2,
 };
 
+/// Reconstructed exec-node kinds used by the lazy runtime.
 enum class ExecKind : uint8_t {
+    // Generic execution kinds.
+
     LeafNfa = 0,
     LeafNft,
     Union,
@@ -28,17 +32,14 @@ enum class ExecKind : uint8_t {
     Project,
     SyncProduct,
 
-    // Fast path, for now these 3 are most uses and are hottest path
-    // Not sure if the Project and SyncProduct should be added as well
-    // For my current usage (Regular Model Checking), they add very
-    // little performance gains and all the works around them not worth the trouble
-    // Also one weird case where LeafNft has arity 1, it is entire possible
-    // but really not a realistic case so I decide to not add here.
+    // Fast path: arity-1 execution kinds.
+
     Arity1Union,
     Arity1Intersect,
     Arity1Complement,
 
-    // Fast path for Arity 2
+    // Fast path: arity-2 execution kinds.
+
     Arity2LeafNft,
     Arity2Union,
     Arity2Intersect,
@@ -47,23 +48,34 @@ enum class ExecKind : uint8_t {
     Arity2SyncProduct,
 };
 
+/**
+ * @brief Compact reconstructed execution node.
+ */
 struct ExecNode {
+    /// Specialized runtime operator kind.
     ExecKind kind;
+    /// Left child or leaf index.
     NodeId lhs;
+    /// Right child when present.
     NodeId rhs;
+    /// Index into auxiliary plan tables when needed.
     uint32_t payload;
+    /// Result arity of the reconstructed node.
     uint8_t result_arity;
 };
 
+/// Return whether @p kind is one of the complement execution kinds.
 constexpr bool is_complement_exec_kind(const ExecKind kind) noexcept {
     return kind == ExecKind::Complement || kind == ExecKind::Arity1Complement || kind == ExecKind::Arity2Complement;
 }
 
+/// Return whether @p kind belongs to the specialized arity-1 fast path.
 constexpr bool is_arity1_exec_kind(const ExecKind kind) noexcept {
     return kind == ExecKind::LeafNfa || kind == ExecKind::Arity1Union || kind == ExecKind::Arity1Intersect ||
            kind == ExecKind::Arity1Complement;
 }
 
+/// Return whether @p kind belongs to the specialized arity-2 fast path.
 constexpr bool is_arity2_exec_kind(const ExecKind kind) noexcept {
     return kind == ExecKind::Arity2LeafNft || kind == ExecKind::Arity2Union || kind == ExecKind::Arity2Intersect ||
            kind == ExecKind::Arity2Complement || kind == ExecKind::Identity || kind == ExecKind::Arity2Project ||
@@ -81,12 +93,19 @@ constexpr uint64_t mix_hash64(uint64_t value) noexcept {
 // Fold a 64-bit hash down to the 32-bit ids used by the macrostate stores.
 constexpr uint32_t fold_hash64(uint64_t value) noexcept { return static_cast<uint32_t>(value ^ (value >> 32)); }
 
+/**
+ * @brief Pair macrostate stored for binary product-like nodes.
+ */
 struct PairState {
     MacroStateId lhs;
     MacroStateId rhs;
 };
 
+/**
+ * @brief Tagged macrostate stored for union-like nodes.
+ */
 struct TaggedState {
+    /// Side tag of the union branch represented by the macrostate.
     enum class Tag : uint8_t {
         Left = 0,
         Right = 1,
@@ -96,9 +115,12 @@ struct TaggedState {
     Tag tag;
 };
 
+/// Complement subset macrostate.
 using SetState = std::unordered_set<MacroStateId>;
+/// Hash key used for coarse antichain bucketing.
 using AntichainBucketKey = uint64_t;
 
+/// Hash a subset macrostate.
 uint32_t hash_states(const SetState& states);
 
 // Hash a binary-product macrostate.

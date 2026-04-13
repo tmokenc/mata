@@ -12,8 +12,12 @@
 
 namespace mata::nft::lazy::detail {
 
+/// Visible label tuple used by the generic transition cache.
 using SymbolTuple = std::vector<mata::Symbol>;
 
+/**
+ * @brief Hash functor for visible symbol tuples.
+ */
 struct SymbolTupleHash {
     // Hash a visible tuple so it can be used as a cache key.
     size_t operator()(const SymbolTuple& tuple) const {
