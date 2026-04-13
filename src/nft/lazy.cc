@@ -88,20 +88,20 @@ void require_language_and_two_tape_transducer(
 
 NodeId SymbolicAutomataTree::insert_leaf(NodeKind kind, NodeId leaf_id, uint8_t result_arity) {
     const NodeId id = static_cast<NodeId>(nodes.size());
-    nodes.push_back(Node{kind, leaf_id, 0, NO_PAYLOAD, result_arity});
+    nodes.push_back(Node{kind, result_arity, leaf_id, 0, NO_PAYLOAD});
     return id;
 }
 
 NodeId SymbolicAutomataTree::insert_unary(NodeKind kind, NodeId child, uint8_t result_arity, uint32_t payload) {
     const NodeId id = static_cast<NodeId>(nodes.size());
-    nodes.push_back(Node{kind, child, 0, payload, result_arity});
+    nodes.push_back(Node{kind, result_arity, child, 0, payload});
     return id;
 }
 
 NodeId
 SymbolicAutomataTree::insert_binary(NodeKind kind, NodeId lhs, NodeId rhs, uint8_t result_arity, uint32_t payload) {
     const NodeId id = static_cast<NodeId>(nodes.size());
-    nodes.push_back(Node{kind, lhs, rhs, payload, result_arity});
+    nodes.push_back(Node{kind, result_arity, lhs, rhs, payload});
     return id;
 }
 
