@@ -8,13 +8,11 @@
 #include "mata/nft/lazy.hh"
 
 #include <cstddef>
-#include <optional>
 #include <vector>
 
 namespace mata::nft::lazy::detail {
 
 using SymbolTuple = std::vector<mata::Symbol>;
-using OptionalTuple = std::vector<std::optional<mata::Symbol>>;
 
 struct SymbolTupleHash {
     // Hash a visible tuple so it can be used as a cache key.

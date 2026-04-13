@@ -11,7 +11,6 @@
 
 #include <algorithm>
 #include <cassert>
-#include <functional>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -121,25 +120,31 @@ struct TransitionCacheContext {
     const AlphabetStore& alphabets;
 };
 
+class TransitionResolver {
+public:
+    virtual ~TransitionResolver() = default;
+
+    virtual const TransitionMap&
+    resolve_visible(NodeId node_id, MacroStateId state, TransitionMap& fallback) const = 0;
+
+    virtual const Arity1TransitionMap&
+    resolve_arity1_visible(NodeId node_id, MacroStateId state, Arity1TransitionMap& fallback) const = 0;
+
+    virtual const Arity2TransitionMap&
+    resolve_arity2_visible(NodeId node_id, MacroStateId state, Arity2TransitionMap& fallback) const = 0;
+};
+
 class TransitionCache {
 public:
-    using TransitionProvider = std::function<const TransitionMap&(NodeId, MacroStateId, TransitionMap&)>;
-    using Arity1TransitionProvider =
-            std::function<const Arity1TransitionMap&(NodeId, MacroStateId, Arity1TransitionMap&)>;
-    using Arity2TransitionProvider =
-            std::function<const Arity2TransitionMap&(NodeId, MacroStateId, Arity2TransitionMap&)>;
-
     explicit TransitionCache(const TransitionCacheContext& context);
 
     const Arity1TransitionMap&
-    get_arity1_visible_transitions(NodeId node_id, MacroStateId state, const Arity1TransitionProvider& child_provider);
+    get_arity1_visible_transitions(NodeId node_id, MacroStateId state, const TransitionResolver& resolver);
 
     const Arity2TransitionMap& get_arity2_visible_transitions(
-            NodeId node_id, MacroStateId state, const Arity2TransitionProvider& arity2_child_provider,
-            const Arity1TransitionProvider& arity1_child_provider, const TransitionProvider& generic_child_provider);
+            NodeId node_id, MacroStateId state, const TransitionResolver& resolver);
 
-    const TransitionMap&
-    get_visible_transitions(NodeId node_id, MacroStateId state, const TransitionProvider& child_provider);
+    const TransitionMap& get_visible_transitions(NodeId node_id, MacroStateId state, const TransitionResolver& resolver);
 
 private:
     using Nfa = mata::nfa::Nfa;
@@ -162,7 +167,6 @@ private:
         return (static_cast<uint64_t>(node_id) << 32) | static_cast<uint64_t>(state);
     }
 
-    static SymbolTuple extract_levels(const SymbolTuple& tuple, const std::vector<uint8_t>& levels);
     static std::optional<size_t> find_sync_peer(const SyncPlan& plan, LevelRef::Side side, uint8_t level);
 
     bool is_resolved_special_symbol(

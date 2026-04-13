@@ -229,7 +229,7 @@ void canonicalize_level_alphabets(
 
 std::string AlphabetStore::symbol_name_for(mata::Alphabet* alphabet, const mata::Symbol symbol) {
     if (alphabet == nullptr) {
-        throw std::runtime_error("Lazy alphabet resolution requires a reverse-translating alphabet.");
+        return std::to_string(symbol);
     }
 
     return alphabet->reverse_translate_symbol(symbol);
