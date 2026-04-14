@@ -14,6 +14,18 @@ namespace mata::nft::lazy::detail {
 
 namespace {
 
+    inline void
+    append_generated_state(std::vector<GeneratedMacroState>& states, const GeneratedMacroState& generated_state) {
+        for (GeneratedMacroState& state : states) {
+            if (state.id == generated_state.id) {
+                state.accepting = state.accepting || generated_state.accepting;
+                return;
+            }
+        }
+
+        states.push_back(generated_state);
+    }
+
     template<typename TransitionMapT, typename KeyFactory>
     void append_leaf_nfa_transitions(
             const std::vector<mata::nfa::Nfa>& nfas, const std::vector<ExecNode>& nodes, const AlphabetStore& alphabets,
@@ -128,6 +140,8 @@ TransitionCache::TransitionCache(const TransitionCacheContext& context)
       nodes{context.nodes}, macro_store{context.macro_store}, alphabets{context.alphabets}, visible_transition_cache{},
       arity1_visible_transition_cache{}, arity2_visible_transition_cache{} {}
 
+// Fast path: arity-1 visible transitions.
+
 const Arity1TransitionMap& TransitionCache::get_arity1_visible_transitions(
         const NodeId node_id, const MacroStateId state, const TransitionResolver& resolver) {
     const ExecNode& node = nodes[node_id];
@@ -189,6 +203,9 @@ const Arity1TransitionMap& TransitionCache::get_arity1_visible_transitions(
     return arity1_visible_transition_cache.emplace(key, Arity1TransitionMap::freeze(std::move(transitions)))
             .first->second;
 }
+
+
+// Fast path: arity-2 visible transitions.
 
 const Arity2TransitionMap& TransitionCache::get_arity2_visible_transitions(
         const NodeId node_id, const MacroStateId state, const TransitionResolver& resolver) {
@@ -358,6 +375,9 @@ const Arity2TransitionMap& TransitionCache::get_arity2_visible_transitions(
     return arity2_visible_transition_cache.emplace(key, Arity2TransitionMap::freeze(std::move(transitions)))
             .first->second;
 }
+
+
+// Generic visible transitions.
 
 const TransitionMap& TransitionCache::get_visible_transitions(
         const NodeId node_id, const MacroStateId state, const TransitionResolver& resolver) {
@@ -541,6 +561,9 @@ const TransitionMap& TransitionCache::get_visible_transitions(
 
     return visible_transition_cache.emplace(key, std::move(transitions)).first->second;
 }
+
+
+// Generic helpers shared by the generic path and arity-specialized fast paths.
 
 std::optional<size_t>
 TransitionCache::find_sync_peer(const SyncPlan& plan, const LevelRef::Side side, const uint8_t level) {
@@ -733,6 +756,9 @@ bool TransitionCache::build_sync_result_tuple(
     return true;
 }
 
+
+// Generic leaf NFT transition enumeration.
+
 void TransitionCache::build_leaf_nft_transitions(
         const NodeId node_id, const Nft& nft, const State source_state, SymbolTuple& current_tuple,
         const size_t next_level, TransitionMap& transitions) {
@@ -757,6 +783,9 @@ void TransitionCache::build_leaf_nft_transitions(
         }
     }
 }
+
+
+// Fast path: arity-2 leaf NFT transition enumeration.
 
 void TransitionCache::build_leaf_arity2_nft_transitions(
         const NodeId node_id, const Nft& nft, const State source_state, const mata::Symbol first_symbol,

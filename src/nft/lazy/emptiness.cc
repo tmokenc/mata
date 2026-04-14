@@ -86,7 +86,7 @@ namespace {
                 std::vector<GeneratedMacroState> states{};
                 NextStateIteratorPtr next_states = make_next_state_iterator(node_id, state, *tuple);
                 while (const std::optional<GeneratedMacroState> next_state = next_states->next()) {
-                    append_generated_state(states, *next_state);
+                    states.push_back(*next_state);
                 }
                 if (states.empty()) {
                     continue;
@@ -96,10 +96,10 @@ namespace {
             return transitions;
         }
 
-        template<typename OutputMap, typename Builder, typename KeyFactory>
+        template<typename OutputMap, typename BuilderMap, typename KeyFactory>
         OutputMap
         build_fallback_visible_transitions_as(const NodeId node_id, const MacroStateId state, KeyFactory&& make_key) {
-            Builder transitions{};
+            BuilderMap transitions{};
             for (const auto& [tuple, states] : build_fallback_visible_transitions(node_id, state)) {
                 transitions.emplace(make_key(tuple), states);
             }
@@ -108,7 +108,8 @@ namespace {
 
         // Arity-1 variant of the generic fallback materialization.
         Arity1TransitionMap build_fallback_arity1_visible_transitions(const NodeId node_id, const MacroStateId state) {
-            return build_fallback_visible_transitions_as<Arity1TransitionMap, Arity1TransitionBuilder>(
+            return build_fallback_visible_transitions_as<
+                    Arity1TransitionMap, std::unordered_map<mata::Symbol, std::vector<GeneratedMacroState>>>(
                     node_id, state, [](const SymbolTuple& tuple) {
                         assert(tuple.size() == 1);
                         return tuple[0];
@@ -116,7 +117,8 @@ namespace {
         }
 
         Arity2TransitionMap build_fallback_arity2_visible_transitions(const NodeId node_id, const MacroStateId state) {
-            return build_fallback_visible_transitions_as<Arity2TransitionMap, Arity2TransitionBuilder>(
+            return build_fallback_visible_transitions_as<
+                    Arity2TransitionMap, std::unordered_map<Arity2TransitionKey, std::vector<GeneratedMacroState>>>(
                     node_id, state, [](const SymbolTuple& tuple) {
                         assert(tuple.size() == 2);
                         return pack_arity2_tuple(tuple);

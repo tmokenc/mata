@@ -85,19 +85,6 @@ private:
     Storage entries_{};
 };
 
-// Merge duplicate generated states while OR-ing their acceptance flag.
-inline void
-append_generated_state(std::vector<GeneratedMacroState>& states, const GeneratedMacroState& generated_state) {
-    for (GeneratedMacroState& state : states) {
-        if (state.id == generated_state.id) {
-            state.accepting = state.accepting || generated_state.accepting;
-            return;
-        }
-    }
-
-    states.push_back(generated_state);
-}
-
 // Fast path: arity-1 transition tables.
 
 /// Builder map for arity-1 transition tables.
