@@ -411,65 +411,50 @@ bool is_empty(
         const std::vector<mata::OnTheFlyAlphabet>* level_alphabets) {
     Context ctx(tree, root_node.get_id(), level_alphabets);
 
-    std::list<MacroStateId> worklist{};
-
-    // The queued is a mirror of worklist, but in a hash set instead of a list
-    // this is to speed up the subsumption process by having constant-time removal
-    std::unordered_set<MacroStateId> queued{};
+    std::vector<MacroStateId> worklist{};
     std::unordered_set<MacroStateId> visited{};
 
     const auto enqueue_if_relevant = [&](const GeneratedMacroState& generated_state) {
-        if (generated_state.accepting) {
-            return false;
+        const MacroStateId state = generated_state.id;
+
+        if (visited.contains(state) || ctx.subsumption.is_subsumed(ctx.root_id, state)) {
+            return;
         }
 
-        if (ctx.subsumption.is_subsumed(ctx.root_id, generated_state.id, visited, queued)) {
-            return true;
-        }
-
-        queued.insert(generated_state.id);
-        worklist.push_back(generated_state.id);
-        return true;
+        visited.insert(state);
+        worklist.push_back(state);
     };
 
     InitialStateIteratorPtr initial_states = ctx.make_initial_state_iterator(ctx.root_id);
+
     while (const std::optional<GeneratedMacroState> initial_state = initial_states->next()) {
-        if (!enqueue_if_relevant(*initial_state)) {
+        if (initial_state->accepting) {
             return false;
         }
+
+        enqueue_if_relevant(*initial_state);
     }
 
-    const auto pop_next_pending_state = [&]() -> std::optional<MacroStateId> {
+    const auto expand_worklist = [&](auto make_labels, auto make_next_states) {
         while (!worklist.empty()) {
             const MacroStateId current_state = worklist.back();
             worklist.pop_back();
-            if (!queued.erase(current_state)) {
+
+            if (ctx.subsumption.is_pruned(current_state)) {
                 continue;
             }
 
-            visited.insert(current_state);
-            return current_state;
-        }
+            auto labels = make_labels(current_state);
 
-        return std::nullopt;
-    };
-
-    const auto drain_next_states = [&](NextStateIteratorPtr next_states) {
-        while (const std::optional<GeneratedMacroState> next_state = next_states->next()) {
-            if (!enqueue_if_relevant(*next_state)) {
-                return false;
-            }
-        }
-
-        return true;
-    };
-
-    const auto expand_worklist = [&](auto make_labels, auto make_next_states) {
-        while (const std::optional<MacroStateId> current_state = pop_next_pending_state()) {
-            auto labels = make_labels(*current_state);
             while (const auto label = labels->next()) {
-                if (!drain_next_states(make_next_states(*current_state, *label))) {
-                    return false;
+                auto iter = make_next_states(current_state, *label);
+
+                while (const std::optional<GeneratedMacroState> next_state = iter->next()) {
+                    if (next_state->accepting) {
+                        return false;
+                    }
+
+                    enqueue_if_relevant(*next_state);
                 }
             }
         }

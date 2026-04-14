@@ -10,19 +10,28 @@
 
 namespace mata::nft::lazy::detail {
 
+std::optional<bool> SubsumptionCache::get(MacroStateId state1, MacroStateId state2) const {
+    auto it = cache.find({state1, state2});
+
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    return std::nullopt;
+}
+
+void SubsumptionCache::set(MacroStateId state1, MacroStateId state2, bool result) { cache[{state1, state2}] = result; }
+
 SubsumptionEngine::SubsumptionEngine(const SubsumptionContext& context)
     : nfas{context.nfas}, nfts{context.nfts}, nodes{context.nodes}, macro_store{context.macro_store},
-      precomputed_simulations(context.nfas.size() + context.nfts.size()) {}
-
-void SubsumptionEngine::set_nfa_simulation(const size_t nfa_index, Simlib::Util::BinaryRelation relation) {
-    precomputed_simulations[nfa_index] = std::move(relation);
-}
-
-void SubsumptionEngine::set_nft_simulation(const size_t nft_index, Simlib::Util::BinaryRelation relation) {
-    precomputed_simulations[nfas.size() + nft_index] = std::move(relation);
-}
+      precomputed_simulation_nfas(context.nfas.size()), precomputed_simulation_nfts(context.nfts.size()), antichain{},
+      caches{} {}
 
 void SubsumptionEngine::initialize_leaf_simulations(const NodeId root_id) {
+    antichain.clear();
+    caches.clear();
+    caches.resize(nodes.size());
+
     std::vector<bool> visited(nodes.size(), false);
     initialize_leaf_simulations_impl(root_id, visited);
 }
@@ -35,14 +44,18 @@ void SubsumptionEngine::initialize_leaf_simulations_impl(const NodeId node_id, s
     const ExecNode& node = nodes[node_id];
 
     switch (node.kind) {
-        case ExecKind::LeafNfa:
-            set_nfa_simulation(node.lhs, mata::nfa::algorithms::compute_relation(nfas[node.lhs]));
+        case ExecKind::LeafNfa: {
+            Simlib::Util::BinaryRelation relation = mata::nfa::algorithms::compute_relation(nfas[node.lhs]);
+            precomputed_simulation_nfas[node.lhs] = std::move(relation);
             break;
+        }
 
         case ExecKind::LeafNft:
-        case ExecKind::Arity2LeafNft:
-            set_nft_simulation(node.lhs, mata::nft::algorithms::compute_relation(nfts[node.lhs]));
+        case ExecKind::Arity2LeafNft: {
+            Simlib::Util::BinaryRelation relation = mata::nft::algorithms::compute_relation(nfts[node.lhs]);
+            precomputed_simulation_nfts[node.lhs] = std::move(relation);
             break;
+        }
 
         case ExecKind::Union:
         case ExecKind::Intersect:
@@ -69,8 +82,7 @@ void SubsumptionEngine::initialize_leaf_simulations_impl(const NodeId node_id, s
     visited[node_id] = true;
 }
 
-bool SubsumptionEngine::subsumed_state(
-        const NodeId node_id, const MacroStateId state1, const MacroStateId state2) const {
+bool SubsumptionEngine::subsumed_state(const NodeId node_id, const MacroStateId state1, const MacroStateId state2) {
     if (state1 == state2) {
         return true;
     }
@@ -78,26 +90,36 @@ bool SubsumptionEngine::subsumed_state(
     const ExecNode& node = nodes[node_id];
     const State s1 = static_cast<State>(state1);
     const State s2 = static_cast<State>(state2);
+    bool result = false;
 
     switch (node.kind) {
         case ExecKind::LeafNfa:
-            return precomputed_simulations[node.lhs].get(s1, s2);
+            result = precomputed_simulation_nfas[node.lhs].get(s1, s2);
+            break;
 
         case ExecKind::LeafNft:
         case ExecKind::Arity2LeafNft:
-            return precomputed_simulations[node.lhs + nfas.size()].get(s1, s2);
+            result = precomputed_simulation_nfts[node.lhs].get(s1, s2);
+            break;
 
         case ExecKind::Union:
         case ExecKind::Arity1Union:
         case ExecKind::Arity2Union: {
+            if (const std::optional<bool> cached_result = caches[node_id].get(state1, state2)) {
+                return *cached_result;
+            }
+
             const TaggedState tagged1 = macro_store.get_tagged(node_id, state1);
             const TaggedState tagged2 = macro_store.get_tagged(node_id, state2);
             if (tagged1.tag != tagged2.tag) {
-                return false;
+                result = false;
+                break;
             }
 
-            return tagged1.tag == TaggedState::Tag::Left ? subsumed_state(node.lhs, tagged1.state, tagged2.state)
-                                                         : subsumed_state(node.rhs, tagged1.state, tagged2.state);
+            result = tagged1.tag == TaggedState::Tag::Left ? subsumed_state(node.lhs, tagged1.state, tagged2.state)
+                                                           : subsumed_state(node.rhs, tagged1.state, tagged2.state);
+            caches[node_id].set(state1, state2, result);
+            break;
         }
 
         case ExecKind::Intersect:
@@ -105,21 +127,34 @@ bool SubsumptionEngine::subsumed_state(
         case ExecKind::Arity1Intersect:
         case ExecKind::Arity2Intersect:
         case ExecKind::Arity2SyncProduct: {
+            if (const std::optional<bool> cached_result = caches[node_id].get(state1, state2)) {
+                return *cached_result;
+            }
+
             const PairState pair1 = macro_store.get_pair(node_id, state1);
             const PairState pair2 = macro_store.get_pair(node_id, state2);
 
-            return subsumed_state(node.lhs, pair1.lhs, pair2.lhs) && subsumed_state(node.rhs, pair1.rhs, pair2.rhs);
+            result = subsumed_state(node.lhs, pair1.lhs, pair2.lhs) && subsumed_state(node.rhs, pair1.rhs, pair2.rhs);
+            caches[node_id].set(state1, state2, result);
+            break;
         }
 
         case ExecKind::Complement:
         case ExecKind::Arity1Complement:
         case ExecKind::Arity2Complement: {
-            const SetState& lhs_sub_states = macro_store.get_set(node_id, state2);
-            const SetState& rhs_sub_states = macro_store.get_set(node_id, state1);
-            if (lhs_sub_states.size() > rhs_sub_states.size()) {
-                return false;
+            if (const std::optional<bool> cached_result = caches[node_id].get(state1, state2)) {
+                return *cached_result;
             }
 
+            const SetState& lhs_sub_states = macro_store.get_set(node_id, state2);
+            const SetState& rhs_sub_states = macro_store.get_set(node_id, state1);
+
+            if (lhs_sub_states.size() > rhs_sub_states.size()) {
+                result = false;
+                break;
+            }
+
+            result = true;
             for (const MacroStateId lhs_sub_state : lhs_sub_states) {
                 bool subsumed = false;
                 for (const MacroStateId rhs_sub_state : rhs_sub_states) {
@@ -130,33 +165,29 @@ bool SubsumptionEngine::subsumed_state(
                 }
 
                 if (!subsumed) {
-                    return false;
+                    result = false;
+                    break;
                 }
             }
 
-            return true;
+            caches[node_id].set(state1, state2, result);
+
+            break;
         }
 
         case ExecKind::Identity:
         case ExecKind::Project:
         case ExecKind::Arity2Project:
-            return subsumed_state(node.lhs, state1, state2);
+            result = subsumed_state(node.lhs, state1, state2);
+            break;
     }
 
-    return false;
+    return result;
 }
 
-bool SubsumptionEngine::is_subsumed(
-        const NodeId root_id, const MacroStateId state, std::unordered_set<MacroStateId>& visited,
-        std::unordered_set<MacroStateId>& queued) const {
-    for (const MacroStateId visited_state : visited) {
-        if (subsumed_state(root_id, state, visited_state)) {
-            return true;
-        }
-    }
-
-    for (const MacroStateId queued_state : queued) {
-        if (subsumed_state(root_id, state, queued_state)) {
+bool SubsumptionEngine::is_subsumed(const NodeId root_id, const MacroStateId state) {
+    for (const MacroStateId antichain_state : antichain) {
+        if (subsumed_state(root_id, state, antichain_state)) {
             return true;
         }
     }
@@ -165,10 +196,12 @@ bool SubsumptionEngine::is_subsumed(
         return subsumed_state(root_id, other_state, state);
     };
 
-    std::erase_if(visited, is_subsumed_by_state);
-    std::erase_if(queued, is_subsumed_by_state);
+    std::erase_if(antichain, is_subsumed_by_state);
+    antichain.insert(state);
 
     return false;
 }
+
+bool SubsumptionEngine::is_pruned(const MacroStateId state) const { return !antichain.contains(state); }
 
 } // namespace mata::nft::lazy::detail
