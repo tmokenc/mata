@@ -27,6 +27,15 @@ nfa::Nfa make_trivial_nfa(bool accepts_epsilon = false) {
     return aut;
 }
 
+nfa::Nfa make_epsilon_nfa_with_state_count(size_t state_count) {
+    nfa::Nfa aut{state_count};
+    if (state_count > 0) {
+        aut.initial = {0};
+        aut.final = {0};
+    }
+    return aut;
+}
+
 Nft make_two_level_identity(Symbol sym = 'a') {
     Nft nft = Nft::with_levels(2, 2, {0}, {1});
     nft.levels.set({0, 0});
@@ -151,8 +160,8 @@ TEST_CASE("mata::nft::lazy is_valid should reject cycles") {
         // Node 0: LeafNfa referencing nfas[0]  (valid leaf, needed as base)
         // Node 1: Complement whose child is node 1 (self-loop)
         tree.nodes = {
-                {NodeKind::LeafNfa, 0, 0, NO_PAYLOAD, 1},
-                {NodeKind::Complement, 1, 0, NO_PAYLOAD, 1},
+                {NodeKind::LeafNfa, 1, 0, 0, NO_PAYLOAD},
+                {NodeKind::Complement, 1, 1, 0, NO_PAYLOAD},
         };
         CHECK_FALSE(tree.is_valid(Term{1}));
     }
@@ -164,8 +173,8 @@ TEST_CASE("mata::nft::lazy is_valid should reject cycles") {
         // Node 0: Union(node 1, node 1)
         // Node 1: Complement(node 0)  -- back-edge to node 0
         tree.nodes = {
-                {NodeKind::Union, 1, 1, NO_PAYLOAD, 1},
-                {NodeKind::Complement, 0, 0, NO_PAYLOAD, 1},
+                {NodeKind::Union, 1, 1, 1, NO_PAYLOAD},
+                {NodeKind::Complement, 1, 0, 0, NO_PAYLOAD},
         };
         CHECK_FALSE(tree.is_valid(Term{0}));
     }
@@ -177,9 +186,9 @@ TEST_CASE("mata::nft::lazy is_valid should reject cycles") {
         // Node 1: Complement(node 0)
         // Node 2: Complement(node 1)
         tree.nodes = {
-                {NodeKind::Complement, 2, 0, NO_PAYLOAD, 1},
-                {NodeKind::Complement, 0, 0, NO_PAYLOAD, 1},
-                {NodeKind::Complement, 1, 0, NO_PAYLOAD, 1},
+                {NodeKind::Complement, 1, 2, 0, NO_PAYLOAD},
+                {NodeKind::Complement, 1, 0, 0, NO_PAYLOAD},
+                {NodeKind::Complement, 1, 1, 0, NO_PAYLOAD},
         };
         CHECK_FALSE(tree.is_valid(Term{2}));
     }
@@ -190,8 +199,8 @@ TEST_CASE("mata::nft::lazy is_valid should reject cycles") {
         // Node 0: LeafNfa (valid, reachable)
         // Node 1: Complement(node 1) -- self-loop, but NOT reachable from node 0
         tree.nodes = {
-                {NodeKind::LeafNfa, 0, 0, NO_PAYLOAD, 1},
-                {NodeKind::Complement, 1, 0, NO_PAYLOAD, 1},
+                {NodeKind::LeafNfa, 1, 0, 0, NO_PAYLOAD},
+                {NodeKind::Complement, 1, 1, 0, NO_PAYLOAD},
         };
         // Validating from node 0 should succeed; the cycle at node 1 is unreachable.
         CHECK(tree.is_valid(Term{0}));
@@ -210,4 +219,38 @@ TEST_CASE("mata::nft::lazy is_valid should accept DAG sharing") {
     [[maybe_unused]] const Term root = tree.intersect(shared, shared);
 
     CHECK(tree.is_valid(root));
+}
+
+TEST_CASE("mata::nft::lazy public API preserves semantics for asymmetric union and intersect trees") {
+    SECTION("union remains non-empty regardless of subtree depth ordering") {
+        SymbolicAutomataTree tree;
+
+        const Term deep_empty = tree.union_(tree.make_term(make_trivial_nfa()), tree.make_term(make_trivial_nfa()));
+        const Term shallow_eps = tree.make_term(make_trivial_nfa(true));
+
+        CHECK_FALSE(tree.is_empty(tree.union_(deep_empty, shallow_eps)));
+        CHECK_FALSE(tree.is_empty(tree.union_(shallow_eps, deep_empty)));
+    }
+
+    SECTION("intersect remains non-empty regardless of equal-depth state-count ordering") {
+        SymbolicAutomataTree tree;
+
+        const Term big_eps = tree.make_term(make_epsilon_nfa_with_state_count(8));
+        const Term small_eps = tree.make_term(make_epsilon_nfa_with_state_count(2));
+
+        CHECK_FALSE(tree.is_empty(tree.intersect(big_eps, small_eps)));
+        CHECK_FALSE(tree.is_empty(tree.intersect(small_eps, big_eps)));
+    }
+
+    SECTION("complement over asymmetric boolean trees preserves the same public result") {
+        SymbolicAutomataTree tree;
+
+        const Term deep_empty = tree.union_(tree.make_term(make_trivial_nfa()), tree.make_term(make_trivial_nfa()));
+        const Term shallow_eps = tree.make_term(make_trivial_nfa(true));
+        const Term union_left = tree.complement(tree.union_(deep_empty, shallow_eps));
+        const Term union_right = tree.complement(tree.union_(shallow_eps, deep_empty));
+
+        CHECK(tree.is_empty(union_left));
+        CHECK(tree.is_empty(union_right));
+    }
 }
