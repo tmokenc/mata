@@ -291,8 +291,8 @@ namespace {
             case NodeKind::LeafNft:
                 output.push_back(
                         ExecNode{
-                                classify_leaf_kind(node.kind, node.result_arity), node.lhs, node.rhs, node.payload,
-                                node.result_arity});
+                                classify_leaf_kind(node.kind, node.result_arity), node.result_arity, node.lhs,
+                                node.rhs, node.payload});
                 return finish(static_cast<NodeId>(output.size() - 1));
 
             case NodeKind::Union:
@@ -306,7 +306,7 @@ namespace {
                         ExecNode{
                                 classify_binary_kind(
                                         node.kind, node.result_arity, output[lhs_id].kind, output[rhs_id].kind),
-                                lhs_id, rhs_id, node.payload, node.result_arity});
+                                node.result_arity, lhs_id, rhs_id, node.payload});
                 if (is_reorderable_binary_kind(output.back().kind)) {
                     reorderable_nodes.push_back(static_cast<NodeId>(output.size() - 1));
                 }
@@ -323,7 +323,7 @@ namespace {
                         ExecNode{
                                 classify_binary_kind(
                                         node.kind, node.result_arity, output[lhs_id].kind, output[rhs_id].kind),
-                                lhs_id, rhs_id, node.payload, node.result_arity});
+                                node.result_arity, lhs_id, rhs_id, node.payload});
                 return finish(static_cast<NodeId>(output.size() - 1));
             }
 
@@ -344,18 +344,18 @@ namespace {
                                 ExecNode{
                                         classify_unary_kind(
                                                 NodeKind::Complement, node.result_arity, output[lhs_id].kind),
-                                        lhs_id, 0, NO_PAYLOAD, node.result_arity});
+                                        node.result_arity, lhs_id, 0, NO_PAYLOAD});
                         output.push_back(
                                 ExecNode{
                                         classify_unary_kind(
                                                 NodeKind::Complement, node.result_arity, output[rhs_id].kind),
-                                        rhs_id, 0, NO_PAYLOAD, node.result_arity});
+                                        node.result_arity, rhs_id, 0, NO_PAYLOAD});
                         output.push_back(
                                 ExecNode{
                                         classify_binary_kind(
                                                 NodeKind::Intersect, node.result_arity, output[complement_lhs_id].kind,
                                                 output[complement_rhs_id].kind),
-                                        complement_lhs_id, complement_rhs_id, NO_PAYLOAD, node.result_arity});
+                                        node.result_arity, complement_lhs_id, complement_rhs_id, NO_PAYLOAD});
                         if (is_reorderable_binary_kind(output.back().kind)) {
                             reorderable_nodes.push_back(static_cast<NodeId>(output.size() - 1));
                         }
@@ -375,18 +375,18 @@ namespace {
                                 ExecNode{
                                         classify_unary_kind(
                                                 NodeKind::Complement, node.result_arity, output[lhs_id].kind),
-                                        lhs_id, 0, NO_PAYLOAD, node.result_arity});
+                                        node.result_arity, lhs_id, 0, NO_PAYLOAD});
                         output.push_back(
                                 ExecNode{
                                         classify_unary_kind(
                                                 NodeKind::Complement, node.result_arity, output[rhs_id].kind),
-                                        rhs_id, 0, NO_PAYLOAD, node.result_arity});
+                                        node.result_arity, rhs_id, 0, NO_PAYLOAD});
                         output.push_back(
                                 ExecNode{
                                         classify_binary_kind(
                                                 NodeKind::Union, node.result_arity, output[complement_lhs_id].kind,
                                                 output[complement_rhs_id].kind),
-                                        complement_lhs_id, complement_rhs_id, NO_PAYLOAD, node.result_arity});
+                                        node.result_arity, complement_lhs_id, complement_rhs_id, NO_PAYLOAD});
                         if (is_reorderable_binary_kind(output.back().kind)) {
                             reorderable_nodes.push_back(static_cast<NodeId>(output.size() - 1));
                         }
@@ -408,7 +408,7 @@ namespace {
                                 ExecNode{
                                         classify_unary_kind(
                                                 NodeKind::Complement, node.result_arity, output[child_id].kind),
-                                        child_id, 0, NO_PAYLOAD, node.result_arity});
+                                        node.result_arity, child_id, 0, NO_PAYLOAD});
                         return finish(static_cast<NodeId>(output.size() - 1));
                     }
                 }
@@ -422,8 +422,8 @@ namespace {
                         reconstruct_nodes(tree, node.lhs, output, reorderable_nodes, rebuilt_ids, active_path);
                 output.push_back(
                         ExecNode{
-                                classify_unary_kind(node.kind, node.result_arity, output[child_id].kind), child_id, 0,
-                                node.payload, node.result_arity});
+                                classify_unary_kind(node.kind, node.result_arity, output[child_id].kind),
+                                node.result_arity, child_id, 0, node.payload});
                 return finish(static_cast<NodeId>(output.size() - 1));
             }
         }

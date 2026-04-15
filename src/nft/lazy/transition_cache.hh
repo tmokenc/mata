@@ -25,10 +25,33 @@ struct GeneratedMacroState {
     bool accepting;
 };
 
+/**
+ * @brief Cached special resolved symbols for one node level.
+ */
+struct ResolvedSpecialSymbols {
+    enum Flag : uint8_t {
+        HasEpsilon = 1U << 0,
+        HasDontCare = 1U << 1,
+    };
+
+    mata::Symbol epsilon{};
+    mata::Symbol dont_care{};
+    uint8_t flags{0};
+};
+
 // Generic transition tables.
 
 /// Generic visible-transition cache map keyed by full tuples.
 using TransitionMap = std::unordered_map<SymbolTuple, std::vector<GeneratedMacroState>, SymbolTupleHash>;
+
+/**
+ * @brief Cached metadata for generic visible-transition maps.
+ */
+struct GenericTransitionCacheEntry {
+    TransitionMap transitions{};
+    std::vector<uint8_t> has_epsilon_by_level{};
+    std::vector<uint8_t> has_dont_care_by_level{};
+};
 
 /**
  * @brief Sorted immutable transition table used by arity-specialized caches.
@@ -128,12 +151,34 @@ inline SymbolTuple unpack_arity2_tuple(const Arity2TransitionKey tuple) {
 }
 
 /**
+ * @brief Cached metadata for specialized arity-2 visible-transition tables.
+ */
+struct Arity2TransitionCacheEntry {
+    Arity2TransitionMap transitions{};
+    bool first_has_epsilon{ false };
+    bool second_has_epsilon{ false };
+    bool first_has_dont_care{ false };
+    bool second_has_dont_care{ false };
+};
+
+/**
+ * @brief Internal sync-plan form with precomputed per-level peer lookup.
+ */
+struct CompiledSyncPlan {
+    std::vector<uint8_t> lhs_sync_levels{};
+    std::vector<uint8_t> rhs_sync_levels{};
+    std::vector<LevelRef> result_layout{};
+    std::vector<int16_t> lhs_sync_peer_by_level{};
+    std::vector<int16_t> rhs_sync_peer_by_level{};
+};
+
+/**
  * @brief References needed by the transition cache.
  */
 struct TransitionCacheContext {
     const std::vector<mata::nfa::Nfa>& nfas;
     const std::vector<mata::nft::Nft>& nfts;
-    const std::vector<SyncPlan>& sync_plans;
+    const std::vector<CompiledSyncPlan>& sync_plans;
     const std::vector<ProjectPlan>& project_plans;
     const std::vector<ExecNode>& nodes;
     MacroStateStore& macro_store;
@@ -199,23 +244,30 @@ private:
 
     const std::vector<Nfa>& nfas;
     const std::vector<Nft>& nfts;
-    const std::vector<SyncPlan>& sync_plans;
+    const std::vector<CompiledSyncPlan>& sync_plans;
     const std::vector<ProjectPlan>& project_plans;
     const std::vector<ExecNode>& nodes;
     MacroStateStore& macro_store;
     const AlphabetStore& alphabets;
+    std::vector<std::vector<ResolvedSpecialSymbols>> special_symbols_by_level;
 
-    std::unordered_map<uint64_t, TransitionMap> visible_transition_cache;
+    std::unordered_map<uint64_t, GenericTransitionCacheEntry> visible_transition_cache;
     std::unordered_map<uint64_t, Arity1TransitionMap> arity1_visible_transition_cache;
-    std::unordered_map<uint64_t, Arity2TransitionMap> arity2_visible_transition_cache;
+    std::unordered_map<uint64_t, Arity2TransitionCacheEntry> arity2_visible_transition_cache;
 
     /// Combine node/state identity into one cache key.
     static constexpr uint64_t state_cache_key(NodeId node_id, MacroStateId state) noexcept {
         return (static_cast<uint64_t>(node_id) << 32) | static_cast<uint64_t>(state);
     }
 
-    /// Find the synchronization partner index of one output level, when it is synchronized.
-    static std::optional<size_t> find_sync_peer(const SyncPlan& plan, LevelRef::Side side, uint8_t level);
+    void initialize_special_symbol_cache();
+    std::optional<mata::Symbol> resolve_special_symbol_id(NodeId node_id, uint8_t level, mata::Symbol special_symbol) const;
+    bool is_resolved_epsilon(NodeId node_id, uint8_t level, mata::Symbol resolved_symbol) const;
+    bool is_resolved_dont_care(NodeId node_id, uint8_t level, mata::Symbol resolved_symbol) const;
+    std::vector<uint8_t> collect_special_symbol_levels(
+            NodeId node_id, const TransitionMap& transitions, mata::Symbol special_symbol) const;
+    Arity2TransitionCacheEntry build_arity2_cache_entry(NodeId node_id, Arity2TransitionBuilder&& transitions) const;
+    GenericTransitionCacheEntry build_generic_cache_entry(NodeId node_id, TransitionMap&& transitions) const;
 
     bool is_resolved_special_symbol(
             NodeId node_id, uint8_t level, mata::Symbol resolved_symbol, mata::Symbol special_symbol) const;
@@ -224,12 +276,12 @@ private:
             mata::Symbol special_symbol) const;
     bool tuple_has_special_symbol(NodeId node_id, const SymbolTuple& tuple, mata::Symbol special_symbol) const;
     bool transition_map_has_special_symbol_on_levels(
-            NodeId node_id, const TransitionMap& transitions, const std::vector<uint8_t>& levels,
+            NodeId node_id, MacroStateId state, const TransitionMap& transitions, const std::vector<uint8_t>& levels,
             mata::Symbol special_symbol) const;
     bool transition_map_has_special_symbol(
-            NodeId node_id, const TransitionMap& transitions, mata::Symbol special_symbol) const;
+            NodeId node_id, MacroStateId state, const TransitionMap& transitions, mata::Symbol special_symbol) const;
     bool arity2_transition_map_has_special_symbol(
-            NodeId node_id, const Arity2TransitionMap& transitions, mata::Symbol special_symbol) const;
+            NodeId node_id, MacroStateId state, const Arity2TransitionMap& transitions, mata::Symbol special_symbol) const;
     bool try_merge_symbols(
             NodeId lhs_node_id, uint8_t lhs_level, mata::Symbol lhs_symbol, NodeId rhs_node_id, uint8_t rhs_level,
             mata::Symbol rhs_symbol, mata::Symbol& merged_symbol) const;
@@ -244,7 +296,7 @@ private:
             NodeId rhs_node_id, const SymbolTuple& rhs_tuple, const std::vector<uint8_t>& rhs_levels) const;
     bool build_sync_result_tuple(
             NodeId lhs_node_id, const SymbolTuple& lhs_tuple, NodeId rhs_node_id, const SymbolTuple& rhs_tuple,
-            const SyncPlan& plan, SymbolTuple& result_tuple) const;
+            const CompiledSyncPlan& plan, SymbolTuple& result_tuple) const;
     /// Recursively enumerate generic NFT leaf transitions.
     void build_leaf_nft_transitions(
             NodeId node_id, const Nft& nft, State source_state, SymbolTuple& current_tuple, size_t next_level,

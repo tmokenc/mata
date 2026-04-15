@@ -29,6 +29,49 @@
 namespace mata::nft::lazy::detail {
 
 namespace {
+    std::vector<CompiledSyncPlan> compile_sync_plans(const std::vector<SyncPlan>& sync_plans) {
+        std::vector<CompiledSyncPlan> compiled_plans{};
+        compiled_plans.reserve(sync_plans.size());
+
+        for (const SyncPlan& plan : sync_plans) {
+            CompiledSyncPlan compiled{};
+            compiled.lhs_sync_levels = plan.lhs_sync_levels;
+            compiled.rhs_sync_levels = plan.rhs_sync_levels;
+            compiled.result_layout = plan.result_layout;
+
+            const uint8_t lhs_levels = [&]() -> uint8_t {
+                uint8_t max_level = 0;
+                for (const uint8_t level : compiled.lhs_sync_levels) {
+                    if (level > max_level) {
+                        max_level = level;
+                    }
+                }
+                return compiled.lhs_sync_levels.empty() ? 0 : static_cast<uint8_t>(max_level + 1);
+            }();
+
+            const uint8_t rhs_levels = [&]() -> uint8_t {
+                uint8_t max_level = 0;
+                for (const uint8_t level : compiled.rhs_sync_levels) {
+                    if (level > max_level) {
+                        max_level = level;
+                    }
+                }
+                return compiled.rhs_sync_levels.empty() ? 0 : static_cast<uint8_t>(max_level + 1);
+            }();
+
+            compiled.lhs_sync_peer_by_level.assign(lhs_levels, -1);
+            compiled.rhs_sync_peer_by_level.assign(rhs_levels, -1);
+            for (size_t i = 0; i < compiled.lhs_sync_levels.size(); ++i) {
+                compiled.lhs_sync_peer_by_level[compiled.lhs_sync_levels[i]] = static_cast<int16_t>(i);
+                compiled.rhs_sync_peer_by_level[compiled.rhs_sync_levels[i]] = static_cast<int16_t>(i);
+            }
+
+            compiled_plans.push_back(std::move(compiled));
+        }
+
+        return compiled_plans;
+    }
+
     struct Context;
     std::shared_ptr<TransitionResolver> make_transition_resolver(Context& ctx);
 
@@ -38,10 +81,10 @@ namespace {
 
         const std::vector<Nfa>& nfas;
         const std::vector<Nft>& nfts;
-        const std::vector<SyncPlan>& sync_plans;
         const std::vector<ProjectPlan>& project_plans;
 
         std::vector<ExecNode> nodes;
+        std::vector<CompiledSyncPlan> sync_plans;
         MacroStateStore macro_store;
         AlphabetStore alphabets;
         SubsumptionEngine subsumption;
@@ -51,15 +94,17 @@ namespace {
 
         Context(const SymbolicAutomataTree& tree, NodeId root,
                 const std::vector<mata::OnTheFlyAlphabet>* root_level_alphabets = nullptr)
-            : nfas(tree.nfas), nfts(tree.nfts), sync_plans(tree.sync_plans), project_plans(tree.project_plans), nodes{},
-              macro_store{}, alphabets{}, subsumption{SubsumptionContext{nfas, nfts, nodes, macro_store}},
+            : nfas(tree.nfas), nfts(tree.nfts), project_plans(tree.project_plans), nodes{},
+              sync_plans{compile_sync_plans(tree.sync_plans)}, macro_store{}, alphabets{},
+              subsumption{SubsumptionContext{nfas, nfts, nodes, macro_store}},
               transition_cache{
                       TransitionCacheContext{nfas, nfts, sync_plans, project_plans, nodes, macro_store, alphabets}},
               transition_resolver{}, root_id{0} {
 
             root_id = reconstruct_nodes(tree, root, nodes);
             macro_store = MacroStateStore(nodes, nfas, nfts);
-            alphabets = AlphabetStore{nodes, root_id, nfas, nfts, sync_plans, project_plans, root_level_alphabets};
+            alphabets = AlphabetStore{
+                    nodes, root_id, nfas, nfts, tree.sync_plans, project_plans, root_level_alphabets};
             transition_resolver = make_transition_resolver(*this);
             subsumption.initialize_leaf_simulations(root_id);
         }
@@ -419,11 +464,14 @@ bool is_empty(
     const auto enqueue_if_relevant = [&](const GeneratedMacroState& generated_state) {
         const MacroStateId state = generated_state.id;
 
-        if (visited.contains(state) || ctx.subsumption.is_subsumed(ctx.root_id, state)) {
+        if (!visited.insert(state).second) {
             return;
         }
 
-        visited.insert(state);
+        if (ctx.subsumption.is_subsumed(ctx.root_id, state)) {
+            visited.erase(state);
+            return;
+        }
         worklist.push_back(state);
     };
 

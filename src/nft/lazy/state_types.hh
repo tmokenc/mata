@@ -54,14 +54,14 @@ enum class ExecKind : uint8_t {
 struct ExecNode {
     /// Specialized runtime operator kind.
     ExecKind kind;
+    /// Result arity of the reconstructed node.
+    uint8_t result_arity;
     /// Left child or leaf index.
     NodeId lhs;
     /// Right child when present.
     NodeId rhs;
     /// Index into auxiliary plan tables when needed.
     uint32_t payload;
-    /// Result arity of the reconstructed node.
-    uint8_t result_arity;
 };
 
 /// Return whether @p kind is one of the complement execution kinds.

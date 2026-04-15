@@ -14,6 +14,18 @@ namespace mata::nft::lazy::detail {
 
 namespace {
 
+    const std::vector<uint8_t>&
+    cached_special_symbol_levels(const GenericTransitionCacheEntry& entry, const mata::Symbol special_symbol) {
+        return special_symbol == mata::nft::EPSILON ? entry.has_epsilon_by_level : entry.has_dont_care_by_level;
+    }
+
+    bool cached_arity2_has_special_symbol(const Arity2TransitionCacheEntry& entry, const mata::Symbol special_symbol) {
+        if (special_symbol == mata::nft::EPSILON) {
+            return entry.first_has_epsilon || entry.second_has_epsilon;
+        }
+        return entry.first_has_dont_care || entry.second_has_dont_care;
+    }
+
     inline void
     append_generated_state(std::vector<GeneratedMacroState>& states, const GeneratedMacroState& generated_state) {
         for (GeneratedMacroState& state : states) {
@@ -81,20 +93,14 @@ namespace {
     void append_exact_intersection_transitions(
             MacroStateStore& macro_store, const NodeId node_id, const InputTransitionMapT& lhs_transitions,
             const InputTransitionMapT& rhs_transitions, OutputTransitionMapT& transitions) {
-        const bool lhs_is_smaller = lhs_transitions.size() <= rhs_transitions.size();
-        const InputTransitionMapT& smaller = lhs_is_smaller ? lhs_transitions : rhs_transitions;
-        const InputTransitionMapT& bigger = lhs_is_smaller ? rhs_transitions : lhs_transitions;
-
-        for (const auto& [label, smaller_states] : smaller) {
-            const auto bigger_it = bigger.find(label);
-            if (bigger_it == bigger.end()) {
+        for (const auto& [label, lhs_states] : lhs_transitions) {
+            const auto rhs_it = rhs_transitions.find(label);
+            if (rhs_it == rhs_transitions.end()) {
                 continue;
             }
 
-            const auto& lhs_states = lhs_is_smaller ? smaller_states : bigger_it->second;
-            const auto& rhs_states = lhs_is_smaller ? bigger_it->second : smaller_states;
             auto& bucket = transitions[label];
-            append_pair_product_states(macro_store, node_id, lhs_states, rhs_states, bucket);
+            append_pair_product_states(macro_store, node_id, lhs_states, rhs_it->second, bucket);
         }
     }
 
@@ -109,27 +115,65 @@ namespace {
 
     template<typename AppendMatch>
     void append_exact_sync_product_matches(
-            const TransitionMap& iterated, const TransitionMap& indexed,
-            const std::vector<uint8_t>& iterated_sync_levels, const std::vector<uint8_t>& indexed_sync_levels,
-            const bool lhs_is_smaller, AppendMatch&& append_match) {
+            const TransitionMap& lhs_transitions, const TransitionMap& rhs_transitions,
+            const std::vector<uint8_t>& lhs_sync_levels, const std::vector<uint8_t>& rhs_sync_levels,
+            AppendMatch&& append_match) {
         std::unordered_map<SymbolTuple, std::vector<const TransitionMap::value_type*>, SymbolTupleHash> sync_index{};
-        sync_index.reserve(indexed.size());
-        for (const auto& entry : indexed) {
-            sync_index[extract_sync_levels(entry.first, indexed_sync_levels)].push_back(&entry);
+        sync_index.reserve(rhs_transitions.size());
+        for (const auto& entry : rhs_transitions) {
+            sync_index[extract_sync_levels(entry.first, rhs_sync_levels)].push_back(&entry);
         }
 
-        for (const auto& iterated_entry : iterated) {
-            const SymbolTuple sync_signature = extract_sync_levels(iterated_entry.first, iterated_sync_levels);
+        for (const auto& lhs_entry : lhs_transitions) {
+            const SymbolTuple sync_signature = extract_sync_levels(lhs_entry.first, lhs_sync_levels);
             const auto matches_it = sync_index.find(sync_signature);
             if (matches_it == sync_index.end()) {
                 continue;
             }
 
-            for (const TransitionMap::value_type* matched_entry : matches_it->second) {
-                const auto& lhs_entry = lhs_is_smaller ? iterated_entry : *matched_entry;
-                const auto& rhs_entry = lhs_is_smaller ? *matched_entry : iterated_entry;
-                append_match(lhs_entry, rhs_entry);
+            for (const TransitionMap::value_type* rhs_entry : matches_it->second) {
+                append_match(lhs_entry, *rhs_entry);
             }
+        }
+    }
+
+    template<
+            typename TransitionMapT, typename ExactIndexT, typename WildcardEntriesT, typename KeyOf,
+            typename HasWildcard>
+    void split_transition_entries(
+            const TransitionMapT& transitions, ExactIndexT& exact_index, WildcardEntriesT& wildcard_entries,
+            KeyOf&& key_of, HasWildcard&& has_wildcard) {
+        exact_index.reserve(transitions.size());
+        wildcard_entries.reserve(transitions.size());
+        for (const auto& entry : transitions) {
+            if (has_wildcard(entry)) {
+                wildcard_entries.push_back(&entry);
+            } else {
+                exact_index[key_of(entry)].push_back(&entry);
+            }
+        }
+    }
+
+    template<
+            typename KeyT, typename ExactIndexT, typename WildcardEntriesT, typename TransitionMapT,
+            typename AppendMatch>
+    void append_matching_entries(
+            const KeyT& key, const bool key_has_wildcard, const ExactIndexT& exact_index,
+            const WildcardEntriesT& wildcard_entries, const TransitionMapT& all_entries, AppendMatch&& append_match) {
+        if (!key_has_wildcard) {
+            if (const auto exact_it = exact_index.find(key); exact_it != exact_index.end()) {
+                for (const auto* entry : exact_it->second) {
+                    append_match(*entry);
+                }
+            }
+            for (const auto* entry : wildcard_entries) {
+                append_match(*entry);
+            }
+            return;
+        }
+
+        for (const auto& entry : all_entries) {
+            append_match(entry);
         }
     }
 
@@ -137,13 +181,14 @@ namespace {
 
 TransitionCache::TransitionCache(const TransitionCacheContext& context)
     : nfas{context.nfas}, nfts{context.nfts}, sync_plans{context.sync_plans}, project_plans{context.project_plans},
-      nodes{context.nodes}, macro_store{context.macro_store}, alphabets{context.alphabets}, visible_transition_cache{},
-      arity1_visible_transition_cache{}, arity2_visible_transition_cache{} {}
+      nodes{context.nodes}, macro_store{context.macro_store}, alphabets{context.alphabets}, special_symbols_by_level{},
+      visible_transition_cache{}, arity1_visible_transition_cache{}, arity2_visible_transition_cache{} {}
 
 // Fast path: arity-1 visible transitions.
 
 const Arity1TransitionMap& TransitionCache::get_arity1_visible_transitions(
         const NodeId node_id, const MacroStateId state, const TransitionResolver& resolver) {
+    initialize_special_symbol_cache();
     const ExecNode& node = nodes[node_id];
     switch (node.kind) {
         case ExecKind::LeafNfa:
@@ -209,6 +254,7 @@ const Arity1TransitionMap& TransitionCache::get_arity1_visible_transitions(
 
 const Arity2TransitionMap& TransitionCache::get_arity2_visible_transitions(
         const NodeId node_id, const MacroStateId state, const TransitionResolver& resolver) {
+    initialize_special_symbol_cache();
     const ExecNode& node = nodes[node_id];
     if (!is_arity2_exec_kind(node.kind) || is_complement_exec_kind(node.kind)) {
         throw std::logic_error("Arity-2 transitions are available only for non-complement arity-2 nodes.");
@@ -217,7 +263,7 @@ const Arity2TransitionMap& TransitionCache::get_arity2_visible_transitions(
     const uint64_t key = state_cache_key(node_id, state);
     const auto it = arity2_visible_transition_cache.find(key);
     if (it != arity2_visible_transition_cache.end()) {
-        return it->second;
+        return it->second.transitions;
     }
 
     Arity2TransitionBuilder transitions{};
@@ -251,8 +297,9 @@ const Arity2TransitionMap& TransitionCache::get_arity2_visible_transitions(
             const Arity2TransitionMap& rhs_transitions =
                     resolver.resolve_arity2_visible(node.rhs, pair.rhs, rhs_fallback);
             const bool needs_wildcard_matching =
-                    arity2_transition_map_has_special_symbol(node.lhs, lhs_transitions, mata::nft::DONT_CARE) ||
-                    arity2_transition_map_has_special_symbol(node.rhs, rhs_transitions, mata::nft::DONT_CARE);
+                    arity2_transition_map_has_special_symbol(
+                            node.lhs, pair.lhs, lhs_transitions, mata::nft::DONT_CARE) ||
+                    arity2_transition_map_has_special_symbol(node.rhs, pair.rhs, rhs_transitions, mata::nft::DONT_CARE);
 
             if (!needs_wildcard_matching) {
                 transitions.reserve(std::min(lhs_transitions.size(), rhs_transitions.size()));
@@ -261,23 +308,31 @@ const Arity2TransitionMap& TransitionCache::get_arity2_visible_transitions(
                 break;
             }
 
-            const bool lhs_is_smaller = lhs_transitions.size() <= rhs_transitions.size();
-            const Arity2TransitionMap& smaller = lhs_is_smaller ? lhs_transitions : rhs_transitions;
-            const Arity2TransitionMap& bigger = lhs_is_smaller ? rhs_transitions : lhs_transitions;
-            for (const auto& [smaller_tuple, smaller_states] : smaller) {
-                for (const auto& [bigger_tuple, bigger_states] : bigger) {
-                    const Arity2TransitionKey lhs_tuple = lhs_is_smaller ? smaller_tuple : bigger_tuple;
-                    const Arity2TransitionKey rhs_tuple = lhs_is_smaller ? bigger_tuple : smaller_tuple;
+            std::unordered_map<Arity2TransitionKey, std::vector<const Arity2TransitionMap::value_type*>> exact_index{};
+            std::vector<const Arity2TransitionMap::value_type*> wildcard_entries{};
+            split_transition_entries(
+                    rhs_transitions, exact_index, wildcard_entries,
+                    [](const Arity2TransitionMap::value_type& entry) { return entry.first; },
+                    [&](const Arity2TransitionMap::value_type& entry) {
+                        return is_resolved_dont_care(node.rhs, 0, arity2_first_symbol(entry.first)) ||
+                               is_resolved_dont_care(node.rhs, 1, arity2_second_symbol(entry.first));
+                    });
+
+            for (const auto& [lhs_tuple, lhs_states] : lhs_transitions) {
+                const auto append_matches = [&](const Arity2TransitionMap::value_type& rhs_entry) {
                     Arity2TransitionKey merged_tuple = 0;
-                    if (!try_merge_arity2_keys(node.lhs, lhs_tuple, node.rhs, rhs_tuple, merged_tuple)) {
-                        continue;
+                    if (!try_merge_arity2_keys(node.lhs, lhs_tuple, node.rhs, rhs_entry.first, merged_tuple)) {
+                        return;
                     }
 
                     auto& bucket = transitions[merged_tuple];
-                    const auto& lhs_states = lhs_is_smaller ? smaller_states : bigger_states;
-                    const auto& rhs_states = lhs_is_smaller ? bigger_states : smaller_states;
-                    append_pair_product_states(macro_store, node_id, lhs_states, rhs_states, bucket);
-                }
+                    append_pair_product_states(macro_store, node_id, lhs_states, rhs_entry.second, bucket);
+                };
+
+                const bool lhs_has_dont_care = is_resolved_dont_care(node.lhs, 0, arity2_first_symbol(lhs_tuple)) ||
+                                               is_resolved_dont_care(node.lhs, 1, arity2_second_symbol(lhs_tuple));
+                append_matching_entries(
+                        lhs_tuple, lhs_has_dont_care, exact_index, wildcard_entries, rhs_transitions, append_matches);
             }
             break;
         }
@@ -313,7 +368,7 @@ const Arity2TransitionMap& TransitionCache::get_arity2_visible_transitions(
 
         case ExecKind::Arity2SyncProduct: {
             const PairState pair = macro_store.get_pair(node_id, state);
-            const SyncPlan& plan = sync_plans[node.payload];
+            const CompiledSyncPlan& plan = sync_plans[node.payload];
             TransitionMap lhs_fallback{};
             TransitionMap rhs_fallback{};
             const TransitionMap& lhs_transitions = resolver.resolve_visible(node.lhs, pair.lhs, lhs_fallback);
@@ -322,18 +377,11 @@ const Arity2TransitionMap& TransitionCache::get_arity2_visible_transitions(
             }
 
             const TransitionMap& rhs_transitions = resolver.resolve_visible(node.rhs, pair.rhs, rhs_fallback);
-            const bool lhs_is_smaller = lhs_transitions.size() <= rhs_transitions.size();
-            const TransitionMap& iterated = lhs_is_smaller ? lhs_transitions : rhs_transitions;
-            const TransitionMap& indexed = lhs_is_smaller ? rhs_transitions : lhs_transitions;
-            const std::vector<uint8_t>& iterated_sync_levels =
-                    lhs_is_smaller ? plan.lhs_sync_levels : plan.rhs_sync_levels;
-            const std::vector<uint8_t>& indexed_sync_levels =
-                    lhs_is_smaller ? plan.rhs_sync_levels : plan.lhs_sync_levels;
             const bool needs_wildcard_matching =
                     transition_map_has_special_symbol_on_levels(
-                            node.lhs, lhs_transitions, plan.lhs_sync_levels, mata::nft::DONT_CARE) ||
+                            node.lhs, pair.lhs, lhs_transitions, plan.lhs_sync_levels, mata::nft::DONT_CARE) ||
                     transition_map_has_special_symbol_on_levels(
-                            node.rhs, rhs_transitions, plan.rhs_sync_levels, mata::nft::DONT_CARE);
+                            node.rhs, pair.rhs, rhs_transitions, plan.rhs_sync_levels, mata::nft::DONT_CARE);
 
             SymbolTuple result_tuple{};
             const auto append_matches = [&](const TransitionMap::value_type& lhs_entry,
@@ -349,21 +397,37 @@ const Arity2TransitionMap& TransitionCache::get_arity2_visible_transitions(
 
             if (!needs_wildcard_matching) {
                 append_exact_sync_product_matches(
-                        iterated, indexed, iterated_sync_levels, indexed_sync_levels, lhs_is_smaller, append_matches);
+                        lhs_transitions, rhs_transitions, plan.lhs_sync_levels, plan.rhs_sync_levels, append_matches);
                 break;
             }
 
-            for (const auto& iterated_entry : iterated) {
-                for (const auto& candidate_entry : indexed) {
-                    const auto& lhs_entry = lhs_is_smaller ? iterated_entry : candidate_entry;
-                    const auto& rhs_entry = lhs_is_smaller ? candidate_entry : iterated_entry;
-                    if (!sync_levels_match(
-                                node.lhs, lhs_entry.first, plan.lhs_sync_levels, node.rhs, rhs_entry.first,
-                                plan.rhs_sync_levels)) {
-                        continue;
-                    }
-                    append_matches(lhs_entry, rhs_entry);
-                }
+            std::unordered_map<SymbolTuple, std::vector<const TransitionMap::value_type*>, SymbolTupleHash>
+                    exact_index{};
+            std::vector<const TransitionMap::value_type*> wildcard_entries{};
+            split_transition_entries(
+                    rhs_transitions, exact_index, wildcard_entries,
+                    [&](const TransitionMap::value_type& entry) {
+                        return extract_sync_levels(entry.first, plan.rhs_sync_levels);
+                    },
+                    [&](const TransitionMap::value_type& entry) {
+                        return tuple_has_special_symbol_on_levels(
+                                node.rhs, entry.first, plan.rhs_sync_levels, mata::nft::DONT_CARE);
+                    });
+
+            for (const auto& lhs_entry : lhs_transitions) {
+                const bool lhs_has_dont_care = tuple_has_special_symbol_on_levels(
+                        node.lhs, lhs_entry.first, plan.lhs_sync_levels, mata::nft::DONT_CARE);
+                const SymbolTuple sync_signature = extract_sync_levels(lhs_entry.first, plan.lhs_sync_levels);
+                append_matching_entries(
+                        sync_signature, lhs_has_dont_care, exact_index, wildcard_entries, rhs_transitions,
+                        [&](const TransitionMap::value_type& rhs_entry) {
+                            if (!sync_levels_match(
+                                        node.lhs, lhs_entry.first, plan.lhs_sync_levels, node.rhs, rhs_entry.first,
+                                        plan.rhs_sync_levels)) {
+                                return;
+                            }
+                            append_matches(lhs_entry, rhs_entry);
+                        });
             }
             break;
         }
@@ -372,8 +436,8 @@ const Arity2TransitionMap& TransitionCache::get_arity2_visible_transitions(
             break;
     }
 
-    return arity2_visible_transition_cache.emplace(key, Arity2TransitionMap::freeze(std::move(transitions)))
-            .first->second;
+    return arity2_visible_transition_cache.emplace(key, build_arity2_cache_entry(node_id, std::move(transitions)))
+            .first->second.transitions;
 }
 
 
@@ -381,6 +445,7 @@ const Arity2TransitionMap& TransitionCache::get_arity2_visible_transitions(
 
 const TransitionMap& TransitionCache::get_visible_transitions(
         const NodeId node_id, const MacroStateId state, const TransitionResolver& resolver) {
+    initialize_special_symbol_cache();
     const ExecNode& node = nodes[node_id];
     if (is_complement_exec_kind(node.kind)) {
         throw std::logic_error("Complement does not expose a finite enabled-transition cache.");
@@ -389,7 +454,7 @@ const TransitionMap& TransitionCache::get_visible_transitions(
     const uint64_t key = state_cache_key(node_id, state);
     const auto it = visible_transition_cache.find(key);
     if (it != visible_transition_cache.end()) {
-        return it->second;
+        return it->second.transitions;
     }
 
     TransitionMap transitions{};
@@ -431,12 +496,9 @@ const TransitionMap& TransitionCache::get_visible_transitions(
             }
 
             const TransitionMap& rhs_transitions = resolver.resolve_visible(node.rhs, pair.rhs, rhs_fallback);
-            const bool lhs_is_smaller = lhs_transitions.size() <= rhs_transitions.size();
-            const TransitionMap& smaller = lhs_is_smaller ? lhs_transitions : rhs_transitions;
-            const TransitionMap& bigger = lhs_is_smaller ? rhs_transitions : lhs_transitions;
             const bool needs_wildcard_matching =
-                    transition_map_has_special_symbol(node.lhs, lhs_transitions, mata::nft::DONT_CARE) ||
-                    transition_map_has_special_symbol(node.rhs, rhs_transitions, mata::nft::DONT_CARE);
+                    transition_map_has_special_symbol(node.lhs, pair.lhs, lhs_transitions, mata::nft::DONT_CARE) ||
+                    transition_map_has_special_symbol(node.rhs, pair.rhs, rhs_transitions, mata::nft::DONT_CARE);
 
             if (!needs_wildcard_matching) {
                 append_exact_intersection_transitions(
@@ -444,20 +506,30 @@ const TransitionMap& TransitionCache::get_visible_transitions(
                 break;
             }
 
+            std::unordered_map<SymbolTuple, std::vector<const TransitionMap::value_type*>, SymbolTupleHash>
+                    exact_index{};
+            std::vector<const TransitionMap::value_type*> wildcard_entries{};
+            split_transition_entries(
+                    rhs_transitions, exact_index, wildcard_entries,
+                    [](const TransitionMap::value_type& entry) -> const SymbolTuple& { return entry.first; },
+                    [&](const TransitionMap::value_type& entry) {
+                        return tuple_has_special_symbol(node.rhs, entry.first, mata::nft::DONT_CARE);
+                    });
+
             SymbolTuple merged_tuple{};
-            for (const auto& [smaller_tuple, smaller_states] : smaller) {
-                for (const auto& [bigger_tuple, bigger_states] : bigger) {
-                    const auto& lhs_tuple = lhs_is_smaller ? smaller_tuple : bigger_tuple;
-                    const auto& rhs_tuple = lhs_is_smaller ? bigger_tuple : smaller_tuple;
-                    const auto& lhs_states = lhs_is_smaller ? smaller_states : bigger_states;
-                    const auto& rhs_states = lhs_is_smaller ? bigger_states : smaller_states;
-                    if (!try_merge_tuples(node.lhs, lhs_tuple, node.rhs, rhs_tuple, merged_tuple)) {
-                        continue;
+            for (const auto& [lhs_tuple, lhs_states] : lhs_transitions) {
+                const auto append_matches = [&](const TransitionMap::value_type& rhs_entry) {
+                    if (!try_merge_tuples(node.lhs, lhs_tuple, node.rhs, rhs_entry.first, merged_tuple)) {
+                        return;
                     }
 
                     auto& bucket = transitions[merged_tuple];
-                    append_pair_product_states(macro_store, node_id, lhs_states, rhs_states, bucket);
-                }
+                    append_pair_product_states(macro_store, node_id, lhs_states, rhs_entry.second, bucket);
+                };
+
+                append_matching_entries(
+                        lhs_tuple, tuple_has_special_symbol(node.lhs, lhs_tuple, mata::nft::DONT_CARE), exact_index,
+                        wildcard_entries, rhs_transitions, append_matches);
             }
             break;
         }
@@ -498,7 +570,7 @@ const TransitionMap& TransitionCache::get_visible_transitions(
         case ExecKind::SyncProduct:
         case ExecKind::Arity2SyncProduct: {
             const PairState pair = macro_store.get_pair(node_id, state);
-            const SyncPlan& plan = sync_plans[node.payload];
+            const CompiledSyncPlan& plan = sync_plans[node.payload];
             TransitionMap lhs_fallback{};
             TransitionMap rhs_fallback{};
             const TransitionMap& lhs_transitions = resolver.resolve_visible(node.lhs, pair.lhs, lhs_fallback);
@@ -507,18 +579,11 @@ const TransitionMap& TransitionCache::get_visible_transitions(
             }
 
             const TransitionMap& rhs_transitions = resolver.resolve_visible(node.rhs, pair.rhs, rhs_fallback);
-            const bool lhs_is_smaller = lhs_transitions.size() <= rhs_transitions.size();
-            const TransitionMap& iterated = lhs_is_smaller ? lhs_transitions : rhs_transitions;
-            const TransitionMap& indexed = lhs_is_smaller ? rhs_transitions : lhs_transitions;
-            const std::vector<uint8_t>& iterated_sync_levels =
-                    lhs_is_smaller ? plan.lhs_sync_levels : plan.rhs_sync_levels;
-            const std::vector<uint8_t>& indexed_sync_levels =
-                    lhs_is_smaller ? plan.rhs_sync_levels : plan.lhs_sync_levels;
             const bool needs_wildcard_matching =
                     transition_map_has_special_symbol_on_levels(
-                            node.lhs, lhs_transitions, plan.lhs_sync_levels, mata::nft::DONT_CARE) ||
+                            node.lhs, pair.lhs, lhs_transitions, plan.lhs_sync_levels, mata::nft::DONT_CARE) ||
                     transition_map_has_special_symbol_on_levels(
-                            node.rhs, rhs_transitions, plan.rhs_sync_levels, mata::nft::DONT_CARE);
+                            node.rhs, pair.rhs, rhs_transitions, plan.rhs_sync_levels, mata::nft::DONT_CARE);
 
             SymbolTuple result_tuple{};
             const auto append_match = [&](const TransitionMap::value_type& lhs_entry,
@@ -534,21 +599,37 @@ const TransitionMap& TransitionCache::get_visible_transitions(
 
             if (!needs_wildcard_matching) {
                 append_exact_sync_product_matches(
-                        iterated, indexed, iterated_sync_levels, indexed_sync_levels, lhs_is_smaller, append_match);
+                        lhs_transitions, rhs_transitions, plan.lhs_sync_levels, plan.rhs_sync_levels, append_match);
                 break;
             }
 
-            for (const auto& iterated_entry : iterated) {
-                for (const auto& candidate_entry : indexed) {
-                    const auto& lhs_entry = lhs_is_smaller ? iterated_entry : candidate_entry;
-                    const auto& rhs_entry = lhs_is_smaller ? candidate_entry : iterated_entry;
-                    if (!sync_levels_match(
-                                node.lhs, lhs_entry.first, plan.lhs_sync_levels, node.rhs, rhs_entry.first,
-                                plan.rhs_sync_levels)) {
-                        continue;
-                    }
-                    append_match(lhs_entry, rhs_entry);
-                }
+            std::unordered_map<SymbolTuple, std::vector<const TransitionMap::value_type*>, SymbolTupleHash>
+                    exact_index{};
+            std::vector<const TransitionMap::value_type*> wildcard_entries{};
+            split_transition_entries(
+                    rhs_transitions, exact_index, wildcard_entries,
+                    [&](const TransitionMap::value_type& entry) {
+                        return extract_sync_levels(entry.first, plan.rhs_sync_levels);
+                    },
+                    [&](const TransitionMap::value_type& entry) {
+                        return tuple_has_special_symbol_on_levels(
+                                node.rhs, entry.first, plan.rhs_sync_levels, mata::nft::DONT_CARE);
+                    });
+
+            for (const auto& lhs_entry : lhs_transitions) {
+                const bool lhs_has_dont_care = tuple_has_special_symbol_on_levels(
+                        node.lhs, lhs_entry.first, plan.lhs_sync_levels, mata::nft::DONT_CARE);
+                const SymbolTuple sync_signature = extract_sync_levels(lhs_entry.first, plan.lhs_sync_levels);
+                append_matching_entries(
+                        sync_signature, lhs_has_dont_care, exact_index, wildcard_entries, rhs_transitions,
+                        [&](const TransitionMap::value_type& rhs_entry) {
+                            if (!sync_levels_match(
+                                        node.lhs, lhs_entry.first, plan.lhs_sync_levels, node.rhs, rhs_entry.first,
+                                        plan.rhs_sync_levels)) {
+                                return;
+                            }
+                            append_match(lhs_entry, rhs_entry);
+                        });
             }
             break;
         }
@@ -559,38 +640,113 @@ const TransitionMap& TransitionCache::get_visible_transitions(
             break;
     }
 
-    return visible_transition_cache.emplace(key, std::move(transitions)).first->second;
+    return visible_transition_cache.emplace(key, build_generic_cache_entry(node_id, std::move(transitions)))
+            .first->second.transitions;
 }
 
 
 // Generic helpers shared by the generic path and arity-specialized fast paths.
 
-std::optional<size_t>
-TransitionCache::find_sync_peer(const SyncPlan& plan, const LevelRef::Side side, const uint8_t level) {
-    if (side == LevelRef::Side::Lhs) {
-        for (size_t i = 0; i < plan.lhs_sync_levels.size(); ++i) {
-            if (plan.lhs_sync_levels[i] == level) {
-                return i;
+void TransitionCache::initialize_special_symbol_cache() {
+    if (special_symbols_by_level.size() == nodes.size()) {
+        return;
+    }
+
+    special_symbols_by_level.clear();
+    special_symbols_by_level.resize(nodes.size());
+    for (NodeId node_id = 0; node_id < nodes.size(); ++node_id) {
+        special_symbols_by_level[node_id].resize(nodes[node_id].result_arity);
+        for (uint8_t level = 0; level < nodes[node_id].result_arity; ++level) {
+            ResolvedSpecialSymbols& resolved = special_symbols_by_level[node_id][level];
+            if (const std::optional<mata::Symbol> epsilon =
+                        resolve_special_symbol_id(node_id, level, mata::nft::EPSILON)) {
+                resolved.epsilon = *epsilon;
+                resolved.flags |= ResolvedSpecialSymbols::HasEpsilon;
             }
-        }
-    } else {
-        for (size_t i = 0; i < plan.rhs_sync_levels.size(); ++i) {
-            if (plan.rhs_sync_levels[i] == level) {
-                return i;
+            if (const std::optional<mata::Symbol> dont_care =
+                        resolve_special_symbol_id(node_id, level, mata::nft::DONT_CARE)) {
+                resolved.dont_care = *dont_care;
+                resolved.flags |= ResolvedSpecialSymbols::HasDontCare;
             }
         }
     }
+}
+
+std::optional<mata::Symbol> TransitionCache::resolve_special_symbol_id(
+        const NodeId node_id, const uint8_t level, const mata::Symbol special_symbol) const {
+    const mata::Alphabet& alphabet = alphabets.level_alphabet(node_id, level);
+    if (dynamic_cast<const mata::IntAlphabet*>(&alphabet) != nullptr) {
+        return special_symbol;
+    }
+
+    try {
+        for (const mata::Symbol symbol : alphabet.get_alphabet_symbols()) {
+            if (alphabet.reverse_translate_symbol(symbol) == std::to_string(special_symbol)) {
+                return symbol;
+            }
+        }
+    } catch (const std::runtime_error&) {}
 
     return std::nullopt;
+}
+
+bool TransitionCache::is_resolved_epsilon(
+        const NodeId node_id, const uint8_t level, const mata::Symbol resolved_symbol) const {
+    const ResolvedSpecialSymbols& resolved = special_symbols_by_level[node_id][level];
+    return (resolved.flags & ResolvedSpecialSymbols::HasEpsilon) != 0 && resolved_symbol == resolved.epsilon;
+}
+
+bool TransitionCache::is_resolved_dont_care(
+        const NodeId node_id, const uint8_t level, const mata::Symbol resolved_symbol) const {
+    const ResolvedSpecialSymbols& resolved = special_symbols_by_level[node_id][level];
+    return (resolved.flags & ResolvedSpecialSymbols::HasDontCare) != 0 && resolved_symbol == resolved.dont_care;
+}
+
+std::vector<uint8_t> TransitionCache::collect_special_symbol_levels(
+        const NodeId node_id, const TransitionMap& transitions, const mata::Symbol special_symbol) const {
+    std::vector<uint8_t> levels(nodes[node_id].result_arity, 0);
+    for (const auto& [tuple, _] : transitions) {
+        for (size_t level = 0; level < tuple.size(); ++level) {
+            if (!levels[level] &&
+                is_resolved_special_symbol(node_id, static_cast<uint8_t>(level), tuple[level], special_symbol)) {
+                levels[level] = 1;
+            }
+        }
+    }
+    return levels;
+}
+
+Arity2TransitionCacheEntry
+TransitionCache::build_arity2_cache_entry(const NodeId node_id, Arity2TransitionBuilder&& transitions) const {
+    Arity2TransitionCacheEntry entry{};
+    entry.transitions = Arity2TransitionMap::freeze(std::move(transitions));
+    for (const auto& [tuple, _] : entry.transitions) {
+        entry.first_has_epsilon =
+                entry.first_has_epsilon || is_resolved_epsilon(node_id, 0, arity2_first_symbol(tuple));
+        entry.second_has_epsilon =
+                entry.second_has_epsilon || is_resolved_epsilon(node_id, 1, arity2_second_symbol(tuple));
+        entry.first_has_dont_care =
+                entry.first_has_dont_care || is_resolved_dont_care(node_id, 0, arity2_first_symbol(tuple));
+        entry.second_has_dont_care =
+                entry.second_has_dont_care || is_resolved_dont_care(node_id, 1, arity2_second_symbol(tuple));
+    }
+    return entry;
+}
+
+GenericTransitionCacheEntry
+TransitionCache::build_generic_cache_entry(const NodeId node_id, TransitionMap&& transitions) const {
+    GenericTransitionCacheEntry entry{};
+    entry.has_epsilon_by_level = collect_special_symbol_levels(node_id, transitions, mata::nft::EPSILON);
+    entry.has_dont_care_by_level = collect_special_symbol_levels(node_id, transitions, mata::nft::DONT_CARE);
+    entry.transitions = std::move(transitions);
+    return entry;
 }
 
 bool TransitionCache::is_resolved_special_symbol(
         const NodeId node_id, const uint8_t level, const mata::Symbol resolved_symbol,
         const mata::Symbol special_symbol) const {
-    try {
-        return alphabets.level_alphabet(node_id, level).reverse_translate_symbol(resolved_symbol) ==
-               std::to_string(special_symbol);
-    } catch (const std::runtime_error&) { return false; }
+    return special_symbol == mata::nft::EPSILON ? is_resolved_epsilon(node_id, level, resolved_symbol)
+                                                : is_resolved_dont_care(node_id, level, resolved_symbol);
 }
 
 bool TransitionCache::tuple_has_special_symbol_on_levels(
@@ -615,8 +771,21 @@ bool TransitionCache::tuple_has_special_symbol(
 }
 
 bool TransitionCache::transition_map_has_special_symbol_on_levels(
-        const NodeId node_id, const TransitionMap& transitions, const std::vector<uint8_t>& levels,
-        const mata::Symbol special_symbol) const {
+        const NodeId node_id, const MacroStateId state, const TransitionMap& transitions,
+        const std::vector<uint8_t>& levels, const mata::Symbol special_symbol) const {
+    if (!is_complement_exec_kind(nodes[node_id].kind)) {
+        const auto it = visible_transition_cache.find(state_cache_key(node_id, state));
+        if (it != visible_transition_cache.end()) {
+            const std::vector<uint8_t>& cached_levels = cached_special_symbol_levels(it->second, special_symbol);
+            for (const uint8_t level : levels) {
+                if (level < cached_levels.size() && cached_levels[level]) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
     for (const auto& [tuple, _] : transitions) {
         if (tuple_has_special_symbol_on_levels(node_id, tuple, levels, special_symbol)) {
             return true;
@@ -626,7 +795,21 @@ bool TransitionCache::transition_map_has_special_symbol_on_levels(
 }
 
 bool TransitionCache::transition_map_has_special_symbol(
-        const NodeId node_id, const TransitionMap& transitions, const mata::Symbol special_symbol) const {
+        const NodeId node_id, const MacroStateId state, const TransitionMap& transitions,
+        const mata::Symbol special_symbol) const {
+    if (!is_complement_exec_kind(nodes[node_id].kind)) {
+        const auto it = visible_transition_cache.find(state_cache_key(node_id, state));
+        if (it != visible_transition_cache.end()) {
+            const std::vector<uint8_t>& cached_levels = cached_special_symbol_levels(it->second, special_symbol);
+            for (const uint8_t has_special_symbol : cached_levels) {
+                if (has_special_symbol) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
     for (const auto& [tuple, _] : transitions) {
         if (tuple_has_special_symbol(node_id, tuple, special_symbol)) {
             return true;
@@ -636,7 +819,15 @@ bool TransitionCache::transition_map_has_special_symbol(
 }
 
 bool TransitionCache::arity2_transition_map_has_special_symbol(
-        const NodeId node_id, const Arity2TransitionMap& transitions, const mata::Symbol special_symbol) const {
+        const NodeId node_id, const MacroStateId state, const Arity2TransitionMap& transitions,
+        const mata::Symbol special_symbol) const {
+    if (!is_complement_exec_kind(nodes[node_id].kind)) {
+        const auto it = arity2_visible_transition_cache.find(state_cache_key(node_id, state));
+        if (it != arity2_visible_transition_cache.end()) {
+            return cached_arity2_has_special_symbol(it->second, special_symbol);
+        }
+    }
+
     for (const auto& [tuple, _] : transitions) {
         if (is_resolved_special_symbol(node_id, 0, arity2_first_symbol(tuple), special_symbol) ||
             is_resolved_special_symbol(node_id, 1, arity2_second_symbol(tuple), special_symbol)) {
@@ -729,22 +920,24 @@ bool TransitionCache::sync_levels_match(
 
 bool TransitionCache::build_sync_result_tuple(
         const NodeId lhs_node_id, const SymbolTuple& lhs_tuple, const NodeId rhs_node_id, const SymbolTuple& rhs_tuple,
-        const SyncPlan& plan, SymbolTuple& result_tuple) const {
+        const CompiledSyncPlan& plan, SymbolTuple& result_tuple) const {
     result_tuple.clear();
     result_tuple.reserve(plan.result_layout.size());
 
     for (const LevelRef ref : plan.result_layout) {
         mata::Symbol symbol = ref.side == LevelRef::Side::Lhs ? lhs_tuple[ref.level] : rhs_tuple[ref.level];
-        const std::optional<size_t> sync_peer = find_sync_peer(plan, ref.side, ref.level);
-        if (sync_peer.has_value()) {
+        const std::vector<int16_t>& peer_by_level =
+                ref.side == LevelRef::Side::Lhs ? plan.lhs_sync_peer_by_level : plan.rhs_sync_peer_by_level;
+        if (ref.level < peer_by_level.size() && peer_by_level[ref.level] >= 0) {
+            const size_t sync_peer = static_cast<size_t>(peer_by_level[ref.level]);
             const mata::Symbol peer_symbol = ref.side == LevelRef::Side::Lhs
-                                                     ? rhs_tuple[plan.rhs_sync_levels[*sync_peer]]
-                                                     : lhs_tuple[plan.lhs_sync_levels[*sync_peer]];
+                                                     ? rhs_tuple[plan.rhs_sync_levels[sync_peer]]
+                                                     : lhs_tuple[plan.lhs_sync_levels[sync_peer]];
             if (!try_merge_symbols(
                         ref.side == LevelRef::Side::Lhs ? lhs_node_id : rhs_node_id, ref.level, symbol,
                         ref.side == LevelRef::Side::Lhs ? rhs_node_id : lhs_node_id,
-                        ref.side == LevelRef::Side::Lhs ? plan.rhs_sync_levels[*sync_peer]
-                                                        : plan.lhs_sync_levels[*sync_peer],
+                        ref.side == LevelRef::Side::Lhs ? plan.rhs_sync_levels[sync_peer]
+                                                        : plan.lhs_sync_levels[sync_peer],
                         peer_symbol, symbol)) {
                 return false;
             }
