@@ -6,6 +6,7 @@
 #include "iterators.hh"
 
 #include <utility>
+#include "subsumption.hh"
 
 namespace mata::nft::lazy::detail {
 
@@ -120,13 +121,16 @@ namespace {
 
     struct ComplementInitialStateIterator final : InitialStateIterator {
         const NodeId parent_id;
+        const NodeId child_id;
         InitialStateIteratorPtr child_iter;
+        SubsumptionEngine& subsumption;
         bool emitted;
 
         ComplementInitialStateIterator(
-                IteratorContext& context, const NodeId node_id, InitialStateIteratorPtr child_initial_iter)
-            : InitialStateIterator{context}, parent_id{node_id}, child_iter{std::move(child_initial_iter)},
-              emitted{false} {}
+                IteratorContext& context, const NodeId node_id, const NodeId next_child_id,
+                InitialStateIteratorPtr child_initial_iter, SubsumptionEngine& subsumption)
+            : InitialStateIterator{context}, parent_id{node_id}, child_id{next_child_id},
+              child_iter{std::move(child_initial_iter)}, subsumption{subsumption}, emitted{false} {}
 
         std::optional<GeneratedMacroState> next() override {
             if (emitted) {
@@ -141,8 +145,10 @@ namespace {
                 accepting = accepting && !sub_initial_state->accepting;
             }
 
-            return GeneratedMacroState{
-                    this->ctx.macro_store_ref().intern(parent_id, std::move(sub_initial_states)), accepting};
+            subsumption.minimize(child_id, sub_initial_states);
+            MacroStateId next_id = this->ctx.macro_store_ref().intern(parent_id, std::move(sub_initial_states));
+
+            return GeneratedMacroState{next_id, accepting};
         }
     };
 
@@ -176,13 +182,14 @@ namespace {
         const NodeId child_id;
         const SetState& sub_states;
         const SymbolTuple tuple;
+        SubsumptionEngine& subsumption;
         bool emitted;
 
         ComplementNextStateIterator(
                 IteratorContext& context, const NodeId node_id, const NodeId next_child_id,
-                const SetState& child_states, SymbolTuple transition_tuple)
+                const SetState& child_states, SymbolTuple transition_tuple, SubsumptionEngine& subsumption)
             : NextStateIterator{context}, parent_id{node_id}, child_id{next_child_id}, sub_states{child_states},
-              tuple{std::move(transition_tuple)}, emitted{false} {}
+              tuple{std::move(transition_tuple)}, subsumption{subsumption}, emitted{false} {}
 
         std::optional<GeneratedMacroState> next() override {
             if (emitted) {
@@ -207,8 +214,11 @@ namespace {
                 }
             }
 
-            return GeneratedMacroState{
-                    this->ctx.macro_store_ref().intern(parent_id, std::move(next_sub_states)), accepting};
+            subsumption.minimize(child_id, next_sub_states);
+
+            MacroStateId next_id = this->ctx.macro_store_ref().intern(parent_id, std::move(next_sub_states));
+
+            return GeneratedMacroState{next_id, accepting};
         }
     };
 
@@ -379,8 +389,10 @@ InitialStateIteratorPtr make_product_initial_state_iterator(
 }
 
 InitialStateIteratorPtr make_complement_initial_state_iterator(
-        IteratorContext& context, const NodeId node_id, InitialStateIteratorPtr child_initial_iter) {
-    return std::make_unique<ComplementInitialStateIterator>(context, node_id, std::move(child_initial_iter));
+        IteratorContext& context, const NodeId node_id, const NodeId child_id,
+        InitialStateIteratorPtr child_initial_iter, SubsumptionEngine& subsumption) {
+    return std::make_unique<ComplementInitialStateIterator>(
+            context, node_id, child_id, std::move(child_initial_iter), subsumption);
 }
 
 InitialStateIteratorPtr
@@ -395,9 +407,9 @@ make_buffered_next_state_iterator(IteratorContext& context, std::vector<Generate
 
 NextStateIteratorPtr make_complement_next_state_iterator(
         IteratorContext& context, const NodeId node_id, const NodeId child_id, const SetState& child_states,
-        SymbolTuple transition_tuple) {
+        SymbolTuple transition_tuple, SubsumptionEngine& subsumption) {
     return std::make_unique<ComplementNextStateIterator>(
-            context, node_id, child_id, child_states, std::move(transition_tuple));
+            context, node_id, child_id, child_states, std::move(transition_tuple), subsumption);
 }
 
 LabelIteratorPtr make_transition_label_iterator(const TransitionMap& transitions) {

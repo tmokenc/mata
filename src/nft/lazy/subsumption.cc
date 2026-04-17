@@ -202,6 +202,31 @@ bool SubsumptionEngine::is_subsumed(const NodeId root_id, const MacroStateId sta
     return false;
 }
 
+void SubsumptionEngine::minimize(const NodeId root_id, SetState& state) {
+    bool changed = true;
+    while (changed) {
+        changed = false;
+
+        for (auto candidate_it = state.begin(); candidate_it != state.end(); ++candidate_it) {
+            const MacroStateId candidate = *candidate_it;
+            bool remove_candidate = false;
+
+            for (const MacroStateId other : state) {
+                if (candidate != other && subsumed_state(root_id, candidate, other)) {
+                    remove_candidate = true;
+                    break;
+                }
+            }
+
+            if (remove_candidate) {
+                state.erase(candidate_it);
+                changed = true;
+                break;
+            }
+        }
+    }
+}
+
 bool SubsumptionEngine::is_pruned(const MacroStateId state) const { return !antichain.contains(state); }
 
 } // namespace mata::nft::lazy::detail

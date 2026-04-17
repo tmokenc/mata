@@ -18,7 +18,6 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
-#include <list>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -103,8 +102,7 @@ namespace {
 
             root_id = reconstruct_nodes(tree, root, nodes);
             macro_store = MacroStateStore(nodes, nfas, nfts);
-            alphabets = AlphabetStore{
-                    nodes, root_id, nfas, nfts, tree.sync_plans, project_plans, root_level_alphabets};
+            alphabets = AlphabetStore{nodes, root_id, nfas, nfts, tree.sync_plans, project_plans, root_level_alphabets};
             transition_resolver = make_transition_resolver(*this);
             subsumption.initialize_leaf_simulations(root_id);
         }
@@ -275,7 +273,7 @@ namespace {
                 case ExecKind::Arity1Complement:
                 case ExecKind::Arity2Complement: {
                     return make_complement_initial_state_iterator(
-                            *this, node_id, make_initial_state_iterator(node.lhs));
+                            *this, node_id, node.lhs, make_initial_state_iterator(node.lhs), subsumption);
                 }
 
                 case ExecKind::Identity:
@@ -295,7 +293,7 @@ namespace {
             }
             const ExecNode& node = nodes[node_id];
             const SetState& sub_states = macro_store.get_set(node_id, state);
-            return make_complement_next_state_iterator(*this, node_id, node.lhs, sub_states, tuple);
+            return make_complement_next_state_iterator(*this, node_id, node.lhs, sub_states, tuple, subsumption);
         }
 
         NextStateIteratorPtr

@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include "subsumption.hh"
 #include "transition_cache.hh"
 
 #include <memory>
@@ -123,7 +124,8 @@ InitialStateIteratorPtr make_product_initial_state_iterator(
         IteratorContext& context, NodeId node_id, NodeId rhs_id, InitialStateIteratorPtr lhs_initial_iter);
 /// Build an iterator over initial states of a complement node.
 InitialStateIteratorPtr make_complement_initial_state_iterator(
-        IteratorContext& context, NodeId node_id, InitialStateIteratorPtr child_initial_iter);
+        IteratorContext& context, NodeId node_id, NodeId child_id, InitialStateIteratorPtr child_initial_iter,
+        SubsumptionEngine& subsumption);
 /// Build an iterator that forwards child initial states unchanged.
 InitialStateIteratorPtr
 make_passthrough_initial_state_iterator(IteratorContext& context, InitialStateIteratorPtr child_initial_iter);
@@ -136,7 +138,7 @@ make_buffered_next_state_iterator(IteratorContext& context, std::vector<Generate
 /// Build a lazy successor iterator for complement states.
 NextStateIteratorPtr make_complement_next_state_iterator(
         IteratorContext& context, NodeId node_id, NodeId child_id, const SetState& child_states,
-        SymbolTuple transition_tuple);
+        SymbolTuple transition_tuple, SubsumptionEngine& subsumption);
 
 // Generic label iterators.
 
