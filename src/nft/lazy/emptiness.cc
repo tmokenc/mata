@@ -21,6 +21,32 @@
 namespace mata::nft::lazy::detail {
 
 namespace {
+    constexpr bool should_cache_transitions(const ExecKind kind) noexcept {
+        switch (kind) {
+            case ExecKind::Intersect:
+            case ExecKind::SyncProduct:
+            case ExecKind::Complement:
+            case ExecKind::Arity1Intersect:
+            case ExecKind::Arity1Complement:
+            case ExecKind::Arity2Intersect:
+            case ExecKind::Arity2Complement:
+            case ExecKind::Arity2SyncProduct:
+                return true;
+
+            case ExecKind::LeafNfa:
+            case ExecKind::LeafNft:
+            case ExecKind::Union:
+            case ExecKind::Identity:
+            case ExecKind::Project:
+            case ExecKind::Arity1Union:
+            case ExecKind::Arity2LeafNft:
+            case ExecKind::Arity2Union:
+            case ExecKind::Arity2Project:
+                return false;
+        }
+        return false;
+    }
+
     struct TransitionCache {
         using Key = std::pair<NodeId, MacroStateId>;
 
@@ -124,6 +150,10 @@ namespace {
         MacroStateStore& macro_store_ref() override { return macro_store; }
 
         TransitionIteratorPtr make_transition_iterator(const NodeId node_id, const MacroStateId state) override {
+            if (!should_cache_transitions(nodes[node_id].kind)) {
+                return make_uncached_transition_iterator(node_id, state);
+            }
+
             if (const std::vector<GeneratedTransition>* cached = transition_cache.get(node_id, state)) {
                 return make_buffered_transition_iterator(*this, *cached);
             }

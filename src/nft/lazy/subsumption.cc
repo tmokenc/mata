@@ -192,10 +192,9 @@ bool SubsumptionEngine::is_subsumed(const NodeId root_id, const MacroStateId sta
         }
     }
 
-    std::erase_if(antichain, [&](const MacroStateId other_state) {
-        return subsumed_state(root_id, other_state, state);
+    std::erase_if(antichain, [&](const MacroStateId antichain_state) {
+        return subsumed_state(root_id, antichain_state, state);
     });
-
     antichain.insert(state);
 
     return false;

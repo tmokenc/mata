@@ -10,6 +10,7 @@
 
 #include <mata/simlib/explicit_lts.hh>
 
+#include <cstdint>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
