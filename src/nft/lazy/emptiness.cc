@@ -284,10 +284,6 @@ bool is_empty(
         const MacroStateId current_state = worklist.back();
         worklist.pop_back();
 
-        if (visited.contains(current_state)) {
-            continue;
-        }
-
         if (ctx.subsumption.is_pruned(current_state)) {
             continue;
         }
