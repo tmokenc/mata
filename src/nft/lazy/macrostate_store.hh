@@ -78,7 +78,7 @@ struct MacroStateStore {
     TaggedState get_tagged(NodeId idx, MacroStateId id) const;
 
     /// Intern a subset state for one exec node.
-    MacroStateId intern(const NodeId idx, const SetState states);
+    MacroStateId intern(const NodeId idx, SetState states);
     /// Intern a pair state for one exec node.
     MacroStateId intern(const NodeId idx, const PairState pair);
     /// Intern a tagged state for one exec node.

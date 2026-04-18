@@ -1,6 +1,6 @@
 /**
  * @file subsumption.hh
- * @brief Private subsumption and antichain bucketing declarations for mata::nft::lazy::detail.
+ * @brief Private subsumption and antichain-pruning declarations for mata::nft::lazy::detail.
  */
 
 #pragma once
@@ -10,13 +10,19 @@
 
 #include <mata/simlib/explicit_lts.hh>
 
+#include <cstdint>
 #include <optional>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
 namespace mata::nft::lazy::detail {
+
+/**
+ * @brief Minimum number of search iterations a state must stay in the antichain
+ * before it participates in antichain pruning.
+ */
+inline constexpr uint64_t kMinAntichainPruneAgeIterations = 2;
 
 /**
  * @brief External references needed by the lazy subsumption engine.
@@ -40,6 +46,11 @@ struct SubsumptionCache {
      * @brief Hash for pairs of macro-state identifiers.
      */
     struct KeyHash {
+        /**
+         * @brief Hash one pair of macro-state identifiers.
+         * @param key Pair of macro-state identifiers.
+         * @return Hash value for @p key.
+         */
         size_t operator()(const std::pair<MacroStateId, MacroStateId>& key) const noexcept {
             return static_cast<size_t>(
                     mix_hash64((static_cast<uint64_t>(key.first) << 32) | static_cast<uint64_t>(key.second)));
@@ -157,8 +168,10 @@ private:
     std::vector<Simlib::Util::BinaryRelation> precomputed_simulation_nfas;
     /// Precomputed simulation relations for NFT leaves.
     std::vector<Simlib::Util::BinaryRelation> precomputed_simulation_nfts;
-    /// Current antichain of non-subsumed states.
-    std::unordered_set<MacroStateId> antichain;
+    /// Current antichain of non-subsumed states with their insertion iterations.
+    std::unordered_map<MacroStateId, uint64_t> antichain;
+    /// Monotone iteration counter advanced on every antichain subsumption query.
+    uint64_t current_iteration;
     /// Per-node subsumption caches.
     std::vector<SubsumptionCache> caches;
 

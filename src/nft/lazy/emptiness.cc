@@ -102,6 +102,7 @@ namespace {
         AlphabetStore alphabets;
         SubsumptionEngine subsumption;
         TransitionTupleHelper transition_tuple_helper;
+        std::vector<std::vector<std::vector<mata::Symbol>>> complement_level_symbols_by_node;
         TransitionCache transition_cache;
         NodeId root_id;
 
@@ -110,12 +111,14 @@ namespace {
             : nfas(tree.nfas), nfts(tree.nfts), project_plans(tree.project_plans), nodes{},
               sync_plans{compile_sync_plans(tree.sync_plans)}, macro_store{}, alphabets{},
               subsumption{SubsumptionContext{nfas, nfts, nodes, macro_store}},
-              transition_tuple_helper{nodes, alphabets}, transition_cache{}, root_id{0} {
+              transition_tuple_helper{nodes, alphabets}, complement_level_symbols_by_node{}, transition_cache{},
+              root_id{0} {
 
             root_id = reconstruct_nodes(tree, root, nodes);
             macro_store = MacroStateStore(nodes, nfas, nfts);
             alphabets = AlphabetStore{nodes, root_id, nfas, nfts, tree.sync_plans, project_plans, root_level_alphabets};
             subsumption.initialize_leaf_simulations(root_id);
+            initialize_complement_level_symbols();
         }
 
         MacroStateStore& macro_store_ref() override { return macro_store; }
@@ -177,15 +180,9 @@ namespace {
                 case ExecKind::Complement:
                 case ExecKind::Arity1Complement:
                 case ExecKind::Arity2Complement: {
-                    std::vector<std::vector<mata::Symbol>> level_symbols(node.result_arity);
-                    for (uint8_t level = 0; level < node.result_arity; ++level) {
-                        level_symbols[level] =
-                                alphabets.level_alphabet(node_id, level).get_alphabet_symbols().to_vector();
-                    }
-
                     return make_complement_transition_iterator(
                             *this, node_id, node.lhs, macro_store.get_set(node_id, state), subsumption,
-                            std::move(level_symbols));
+                            complement_level_symbols_by_node[node_id]);
                 }
 
                 case ExecKind::Identity:
@@ -198,6 +195,45 @@ namespace {
             }
 
             throw std::logic_error("Unreachable transition reconstruction branch.");
+        }
+
+        void initialize_complement_level_symbols() {
+            complement_level_symbols_by_node.clear();
+            complement_level_symbols_by_node.resize(nodes.size());
+
+            for (NodeId node_id = 0; node_id < nodes.size(); ++node_id) {
+                const ExecNode& node = nodes[node_id];
+                switch (node.kind) {
+                    case ExecKind::Complement:
+                    case ExecKind::Arity1Complement:
+                    case ExecKind::Arity2Complement: {
+                        std::vector<std::vector<mata::Symbol>>& level_symbols =
+                                complement_level_symbols_by_node[node_id];
+                        level_symbols.resize(node.result_arity);
+                        for (uint8_t level = 0; level < node.result_arity; ++level) {
+                            level_symbols[level] =
+                                    alphabets.level_alphabet(node_id, level).get_alphabet_symbols().to_vector();
+                        }
+                        break;
+                    }
+
+                    case ExecKind::LeafNfa:
+                    case ExecKind::LeafNft:
+                    case ExecKind::Union:
+                    case ExecKind::Intersect:
+                    case ExecKind::Identity:
+                    case ExecKind::Project:
+                    case ExecKind::SyncProduct:
+                    case ExecKind::Arity1Union:
+                    case ExecKind::Arity1Intersect:
+                    case ExecKind::Arity2LeafNft:
+                    case ExecKind::Arity2Union:
+                    case ExecKind::Arity2Intersect:
+                    case ExecKind::Arity2Project:
+                    case ExecKind::Arity2SyncProduct:
+                        break;
+                }
+            }
         }
 
     public:

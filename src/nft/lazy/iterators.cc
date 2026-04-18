@@ -44,7 +44,8 @@ void TransitionTupleHelper::initialize_special_symbol_cache() {
         special_symbols_by_level[node_id].resize(nodes[node_id].result_arity);
         for (uint8_t level = 0; level < nodes[node_id].result_arity; ++level) {
             ResolvedSpecialSymbols& resolved = special_symbols_by_level[node_id][level];
-            if (const std::optional<mata::Symbol> epsilon = resolve_special_symbol_id(node_id, level, mata::nft::EPSILON)) {
+            if (const std::optional<mata::Symbol> epsilon =
+                        resolve_special_symbol_id(node_id, level, mata::nft::EPSILON)) {
                 resolved.epsilon = *epsilon;
                 resolved.flags |= ResolvedSpecialSymbols::HasEpsilon;
             }
@@ -316,7 +317,7 @@ namespace {
             SetState sub_initial_states{};
             bool accepting = true;
             while (const std::optional<GeneratedMacroState> sub_initial_state = child_iter->next()) {
-                sub_initial_states.insert(sub_initial_state->id);
+                sub_initial_states.push_back(sub_initial_state->id);
                 accepting = accepting && !sub_initial_state->accepting;
             }
 
@@ -349,12 +350,8 @@ namespace {
         LeafNfaTransitionIterator(
                 IteratorContext& context, const mata::nfa::Nfa& automaton, const AlphabetStore& alphabet_store,
                 const NodeId exec_node_id, const MacroStateId state)
-            : TransitionIterator{context},
-              nfa{automaton},
-              alphabets{alphabet_store},
-              node_id{exec_node_id},
-              moves{nfa.delta.state_post(static_cast<mata::nfa::State>(state)).moves()},
-              current{moves.begin()},
+            : TransitionIterator{context}, nfa{automaton}, alphabets{alphabet_store}, node_id{exec_node_id},
+              moves{nfa.delta.state_post(static_cast<mata::nfa::State>(state)).moves()}, current{moves.begin()},
               end{mata::nfa::StatePost::Moves::end()} {}
 
         std::optional<GeneratedTransition> next() override {
@@ -369,8 +366,7 @@ namespace {
 
                 return GeneratedTransition{
                         SymbolTuple{resolved_symbol},
-                        GeneratedMacroState{
-                                static_cast<MacroStateId>(move.target), nfa.final.contains(move.target)}};
+                        GeneratedMacroState{static_cast<MacroStateId>(move.target), nfa.final.contains(move.target)}};
             }
 
             return std::nullopt;
@@ -402,16 +398,9 @@ namespace {
         LeafNftTransitionIterator(
                 IteratorContext& context, const mata::nft::Nft& automaton, const AlphabetStore& alphabet_store,
                 const NodeId exec_node_id, const MacroStateId state, const size_t result_arity)
-            : TransitionIterator{context},
-              nft{automaton},
-              alphabets{alphabet_store},
-              node_id{exec_node_id},
-              arity{result_arity},
-              source_state{static_cast<mata::nfa::State>(state)},
-              frames{},
-              current_tuple(result_arity, 0),
-              initialized{false},
-              emitted_empty{false} {}
+            : TransitionIterator{context}, nft{automaton}, alphabets{alphabet_store}, node_id{exec_node_id},
+              arity{result_arity}, source_state{static_cast<mata::nfa::State>(state)}, frames{},
+              current_tuple(result_arity, 0), initialized{false}, emitted_empty{false} {}
 
         std::optional<GeneratedTransition> next() override {
             if (arity == 0) {
@@ -421,8 +410,7 @@ namespace {
                 emitted_empty = true;
                 return GeneratedTransition{
                         SymbolTuple{},
-                        GeneratedMacroState{
-                                static_cast<MacroStateId>(source_state), nft.final.contains(source_state)}};
+                        GeneratedMacroState{static_cast<MacroStateId>(source_state), nft.final.contains(source_state)}};
             }
 
             if (!initialized) {
@@ -473,7 +461,8 @@ namespace {
         const std::vector<GeneratedTransition>& transitions;
         size_t index;
 
-        BufferedTransitionIterator(IteratorContext& context, const std::vector<GeneratedTransition>& buffered_transitions)
+        BufferedTransitionIterator(
+                IteratorContext& context, const std::vector<GeneratedTransition>& buffered_transitions)
             : TransitionIterator{context}, transitions{buffered_transitions}, index{0} {}
 
         std::optional<GeneratedTransition> next() override {
@@ -493,7 +482,8 @@ namespace {
         UnionTransitionIterator(
                 IteratorContext& context, const NodeId node_id, const TaggedState::Tag branch_tag,
                 TransitionIteratorPtr child_transition_iter)
-            : TransitionIterator{context}, parent_id{node_id}, tag{branch_tag}, child_iter{std::move(child_transition_iter)} {}
+            : TransitionIterator{context}, parent_id{node_id}, tag{branch_tag},
+              child_iter{std::move(child_transition_iter)} {}
 
         std::optional<GeneratedTransition> next() override {
             const std::optional<GeneratedTransition> child_transition = child_iter->next();
@@ -562,17 +552,12 @@ namespace {
         std::optional<GeneratedTransition> current_lhs;
 
         IntersectTransitionIterator(
-                IteratorContext& context, TransitionTupleHelper& tuple_helper, const NodeId node_id, const NodeId next_lhs_id,
-                const MacroStateId lhs_state, const NodeId next_rhs_id, const MacroStateId next_rhs_state)
-            : TransitionIterator{context},
-              transition_tuple_helper{tuple_helper},
-              parent_id{node_id},
-              lhs_id{next_lhs_id},
-              rhs_id{next_rhs_id},
-              rhs_state{next_rhs_state},
-              lhs_iter{this->ctx.make_transition_iterator(lhs_id, lhs_state)},
-              rhs_iter{},
-              current_lhs{} {
+                IteratorContext& context, TransitionTupleHelper& tuple_helper, const NodeId node_id,
+                const NodeId next_lhs_id, const MacroStateId lhs_state, const NodeId next_rhs_id,
+                const MacroStateId next_rhs_state)
+            : TransitionIterator{context}, transition_tuple_helper{tuple_helper}, parent_id{node_id},
+              lhs_id{next_lhs_id}, rhs_id{next_rhs_id}, rhs_state{next_rhs_state},
+              lhs_iter{this->ctx.make_transition_iterator(lhs_id, lhs_state)}, rhs_iter{}, current_lhs{} {
             advance_lhs();
         }
 
@@ -626,19 +611,12 @@ namespace {
         std::optional<GeneratedTransition> current_lhs;
 
         SyncProductTransitionIterator(
-                IteratorContext& context, TransitionTupleHelper& tuple_helper, const NodeId node_id, const NodeId next_lhs_id,
-                const MacroStateId lhs_state, const NodeId next_rhs_id, const MacroStateId next_rhs_state,
-                const CompiledSyncPlan& compiled_plan)
-            : TransitionIterator{context},
-              transition_tuple_helper{tuple_helper},
-              parent_id{node_id},
-              lhs_id{next_lhs_id},
-              rhs_id{next_rhs_id},
-              rhs_state{next_rhs_state},
-              plan{compiled_plan},
-              lhs_iter{this->ctx.make_transition_iterator(lhs_id, lhs_state)},
-              rhs_iter{},
-              current_lhs{} {
+                IteratorContext& context, TransitionTupleHelper& tuple_helper, const NodeId node_id,
+                const NodeId next_lhs_id, const MacroStateId lhs_state, const NodeId next_rhs_id,
+                const MacroStateId next_rhs_state, const CompiledSyncPlan& compiled_plan)
+            : TransitionIterator{context}, transition_tuple_helper{tuple_helper}, parent_id{node_id},
+              lhs_id{next_lhs_id}, rhs_id{next_rhs_id}, rhs_state{next_rhs_state}, plan{compiled_plan},
+              lhs_iter{this->ctx.make_transition_iterator(lhs_id, lhs_state)}, rhs_iter{}, current_lhs{} {
             advance_lhs();
         }
 
@@ -685,23 +663,18 @@ namespace {
         const NodeId child_id;
         const SetState& sub_states;
         SubsumptionEngine& subsumption;
-        std::vector<std::vector<mata::Symbol>> level_symbols;
+        const std::vector<std::vector<mata::Symbol>>& level_symbols;
         std::vector<size_t> indices;
         SymbolTuple current_tuple;
         bool finished;
 
         ComplementTransitionIterator(
-                IteratorContext& context, const NodeId node_id, const NodeId next_child_id, const SetState& child_states,
-                SubsumptionEngine& subsumption, std::vector<std::vector<mata::Symbol>> symbols_per_level)
-            : TransitionIterator{context},
-              parent_id{node_id},
-              child_id{next_child_id},
-              sub_states{child_states},
-              subsumption{subsumption},
-              level_symbols{std::move(symbols_per_level)},
-              indices(level_symbols.size(), 0),
-              current_tuple(level_symbols.size(), 0),
-              finished{false} {
+                IteratorContext& context, const NodeId node_id, const NodeId next_child_id,
+                const SetState& child_states, SubsumptionEngine& subsumption,
+                const std::vector<std::vector<mata::Symbol>>& symbols_per_level)
+            : TransitionIterator{context}, parent_id{node_id}, child_id{next_child_id}, sub_states{child_states},
+              subsumption{subsumption}, level_symbols{symbols_per_level}, indices(level_symbols.size(), 0),
+              current_tuple(level_symbols.size(), 0), finished{false} {
             for (size_t level = 0; level < level_symbols.size(); ++level) {
                 if (level_symbols[level].empty()) {
                     finished = true;
@@ -731,7 +704,7 @@ namespace {
                         continue;
                     }
 
-                    next_sub_states.insert(child_transition->state.id);
+                    next_sub_states.push_back(child_transition->state.id);
                     accepting = accepting && !child_transition->state.accepting;
                 }
             }
@@ -816,8 +789,7 @@ make_buffered_transition_iterator(IteratorContext& context, const std::vector<Ge
 TransitionIteratorPtr make_union_transition_iterator(
         IteratorContext& context, const NodeId node_id, const TaggedState::Tag branch_tag,
         TransitionIteratorPtr child_transition_iter) {
-    return std::make_unique<UnionTransitionIterator>(
-            context, node_id, branch_tag, std::move(child_transition_iter));
+    return std::make_unique<UnionTransitionIterator>(context, node_id, branch_tag, std::move(child_transition_iter));
 }
 
 TransitionIteratorPtr
@@ -847,9 +819,9 @@ TransitionIteratorPtr make_sync_product_transition_iterator(
 
 TransitionIteratorPtr make_complement_transition_iterator(
         IteratorContext& context, const NodeId node_id, const NodeId child_id, const SetState& child_states,
-        SubsumptionEngine& subsumption, std::vector<std::vector<mata::Symbol>> symbols_per_level) {
+        SubsumptionEngine& subsumption, const std::vector<std::vector<mata::Symbol>>& symbols_per_level) {
     return std::make_unique<ComplementTransitionIterator>(
-            context, node_id, child_id, child_states, subsumption, std::move(symbols_per_level));
+            context, node_id, child_id, child_states, subsumption, symbols_per_level);
 }
 
 } // namespace mata::nft::lazy::detail

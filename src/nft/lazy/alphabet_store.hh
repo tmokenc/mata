@@ -17,6 +17,14 @@ namespace mata::nft::lazy::detail {
  * @brief Owns resolved visible alphabets for reconstructed lazy exec nodes.
  */
 class AlphabetStore {
+    /**
+     * @brief Translate one visible symbol name into the resolved alphabet of a node level.
+     * @param node_id Reconstructed exec node id.
+     * @param level Visible level within the node.
+     * @param symbol_name Stable visible symbol name to translate.
+     * @param resolved_symbol Output parameter receiving the translated symbol on success.
+     * @return `true` if the symbol exists in the resolved alphabet, `false` otherwise.
+     */
     bool try_translate_symbol_name_to_resolved(
             NodeId node_id, uint8_t level, const std::string& symbol_name, mata::Symbol& resolved_symbol) const;
 

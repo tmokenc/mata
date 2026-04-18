@@ -6,9 +6,9 @@
 #pragma once
 
 #include "mata/nft/lazy.hh"
+#include "mata/utils/ord-vector.hh"
 
 #include <cstdint>
-#include <unordered_set>
 
 namespace mata::nft::lazy::detail {
 
@@ -64,25 +64,24 @@ struct ExecNode {
     uint32_t payload;
 };
 
-/// Return whether @p kind is one of the complement execution kinds.
-constexpr bool is_complement_exec_kind(const ExecKind kind) noexcept {
-    return kind == ExecKind::Complement || kind == ExecKind::Arity1Complement || kind == ExecKind::Arity2Complement;
-}
-
 /// Return whether @p kind belongs to the specialized arity-1 fast path.
 constexpr bool is_arity1_exec_kind(const ExecKind kind) noexcept {
     return kind == ExecKind::LeafNfa || kind == ExecKind::Arity1Union || kind == ExecKind::Arity1Intersect ||
            kind == ExecKind::Arity1Complement;
 }
 
-/// Return whether @p kind belongs to the specialized arity-2 fast path.
-constexpr bool is_arity2_exec_kind(const ExecKind kind) noexcept {
-    return kind == ExecKind::Arity2LeafNft || kind == ExecKind::Arity2Union || kind == ExecKind::Arity2Intersect ||
-           kind == ExecKind::Arity2Complement || kind == ExecKind::Identity || kind == ExecKind::Arity2Project ||
-           kind == ExecKind::Arity2SyncProduct;
-}
-
-// Mix one integer into a stable 64-bit hash state.
+/**
+ * @brief Mix one integer into a stable 64-bit hash state.
+ *
+ * This follows the SplitMix64-style mixing step: `0x9e3779b97f4a7c15` is the
+ * `GOLDEN_GAMMA` increment from Steele, Lea, and Flood's "Fast Splittable
+ * Pseudorandom Number Generators" (OOPSLA 2014), while
+ * `0xbf58476d1ce4e5b9` and `0x94d049bb133111eb` are the constants from David
+ * Stafford's "variant 13" 64-bit mixer, which uses for bit diffusion.
+ *
+ * @param value Input integer value.
+ * @return Mixed 64-bit hash value.
+ */
 constexpr uint64_t mix_hash64(uint64_t value) noexcept {
     value += 0x9e3779b97f4a7c15ULL;
     value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
@@ -90,7 +89,11 @@ constexpr uint64_t mix_hash64(uint64_t value) noexcept {
     return value ^ (value >> 31);
 }
 
-// Fold a 64-bit hash down to the 32-bit ids used by the macrostate stores.
+/**
+ * @brief Fold a 64-bit hash down to the 32-bit ids used by the macrostate stores.
+ * @param value 64-bit hash value.
+ * @return Folded 32-bit hash value.
+ */
 constexpr uint32_t fold_hash64(uint64_t value) noexcept { return static_cast<uint32_t>(value ^ (value >> 32)); }
 
 /**
@@ -115,32 +118,50 @@ struct TaggedState {
     Tag tag;
 };
 
-/// Complement subset macrostate.
-using SetState = std::unordered_set<MacroStateId>;
-/// Hash key used for coarse antichain bucketing.
-using AntichainBucketKey = uint64_t;
+/// Complement subset macrostate kept in sorted canonical order.
+using SetState = mata::utils::OrdVector<MacroStateId>;
 
-/// Hash a subset macrostate.
-uint32_t hash_states(const SetState& states);
+/**
+ * @brief Canonicalize one subset macrostate in-place.
+ *
+ * The canonical representation is a sorted vector without duplicates.
+ *
+ * @param states Subset macrostate to canonicalize.
+ */
+inline void canonicalize_set_state(SetState& states) { states = SetState{states.begin(), states.end()}; }
 
-// Hash a binary-product macrostate.
+/**
+ * @brief Hash a subset macrostate.
+ * @param states Subset macrostate to hash.
+ * @return Hash value used for interning.
+ */
+inline uint32_t hash_states(const SetState& states) {
+    uint64_t hash = mix_hash64(states.size());
+    for (const MacroStateId& id : states) {
+        hash ^= mix_hash64(id);
+    }
+    return fold_hash64(mix_hash64(hash));
+}
+
+/**
+ * @brief Hash a binary-product macrostate.
+ * @param pair Pair macrostate to hash.
+ * @return Hash value used for interning.
+ */
 constexpr uint32_t hash_pair(const PairState& pair) noexcept {
     const uint64_t packed = (static_cast<uint64_t>(pair.lhs) << 32) | static_cast<uint64_t>(pair.rhs);
     return fold_hash64(mix_hash64(packed));
 }
 
-// Hash a tagged union macrostate.
+/**
+ * @brief Hash a tagged union macrostate.
+ * @param tagged Tagged macrostate to hash.
+ * @return Hash value used for interning.
+ */
 constexpr uint32_t hash_tagged(const TaggedState& tagged) noexcept {
     const uint64_t packed =
             (static_cast<uint64_t>(tagged.state) << 8) | static_cast<uint64_t>(static_cast<uint8_t>(tagged.tag));
     return fold_hash64(mix_hash64(packed));
-}
-
-// Extend an antichain bucket key with one more structural component.
-constexpr AntichainBucketKey mix_bucket_key(AntichainBucketKey seed, AntichainBucketKey value) noexcept {
-    constexpr AntichainBucketKey k_mul = 0x9e3779b97f4a7c15ULL;
-    seed ^= value + k_mul + (seed << 6) + (seed >> 2);
-    return seed;
 }
 
 } // namespace mata::nft::lazy::detail

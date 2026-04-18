@@ -184,6 +184,7 @@ TaggedState MacroStateStore::get_tagged(const NodeId idx, const MacroStateId id)
 
 MacroStateId MacroStateStore::intern(const NodeId idx, SetState states) {
     SetStore& store = set_stores[node_to_store_index[idx]];
+    canonicalize_set_state(states);
     MacroStateId id = hash_states(states);
 
     while (true) {
