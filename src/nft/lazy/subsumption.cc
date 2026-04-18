@@ -10,16 +10,6 @@
 
 namespace mata::nft::lazy::detail {
 
-namespace {
-
-    constexpr bool
-    is_antichain_prune_eligible(const uint64_t inserted_iteration, const uint64_t current_iteration) noexcept {
-        return current_iteration >= inserted_iteration &&
-               current_iteration - inserted_iteration >= kMinAntichainPruneAgeIterations;
-    }
-
-} // namespace
-
 std::optional<bool> SubsumptionCache::get(MacroStateId state1, MacroStateId state2) const {
     auto it = cache.find({state1, state2});
 
@@ -35,13 +25,12 @@ void SubsumptionCache::set(MacroStateId state1, MacroStateId state2, bool result
 SubsumptionEngine::SubsumptionEngine(const SubsumptionContext& context)
     : nfas{context.nfas}, nfts{context.nfts}, nodes{context.nodes}, macro_store{context.macro_store},
       precomputed_simulation_nfas(context.nfas.size()), precomputed_simulation_nfts(context.nfts.size()), antichain{},
-      current_iteration{0}, caches{} {}
+      caches{} {}
 
 void SubsumptionEngine::initialize_leaf_simulations(const NodeId root_id) {
     antichain.clear();
     caches.clear();
     caches.resize(nodes.size());
-    current_iteration = 0;
 
     std::vector<bool> visited(nodes.size(), false);
     initialize_leaf_simulations_impl(root_id, visited);
@@ -197,34 +186,17 @@ bool SubsumptionEngine::subsumed_state(const NodeId node_id, const MacroStateId 
 }
 
 bool SubsumptionEngine::is_subsumed(const NodeId root_id, const MacroStateId state) {
-    ++current_iteration;
-
-    for (const auto& [antichain_state, inserted_iteration] : antichain) {
-        if (!is_antichain_prune_eligible(inserted_iteration, current_iteration)) {
-            continue;
-        }
-
+    for (const MacroStateId antichain_state : antichain) {
         if (subsumed_state(root_id, state, antichain_state)) {
             return true;
         }
     }
 
-    std::vector<MacroStateId> erased_states{};
-    for (const auto& [other_state, inserted_iteration] : antichain) {
-        if (!is_antichain_prune_eligible(inserted_iteration, current_iteration)) {
-            continue;
-        }
+    std::erase_if(antichain, [&](const MacroStateId other_state) {
+        return subsumed_state(root_id, other_state, state);
+    });
 
-        if (subsumed_state(root_id, other_state, state)) {
-            erased_states.push_back(other_state);
-        }
-    }
-
-    for (const MacroStateId erased_state : erased_states) {
-        antichain.erase(erased_state);
-    }
-
-    antichain.insert_or_assign(state, current_iteration);
+    antichain.insert(state);
 
     return false;
 }
