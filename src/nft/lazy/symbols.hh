@@ -12,7 +12,7 @@
 
 namespace mata::nft::lazy::detail {
 
-/// Visible label tuple used by the generic transition cache.
+/// Visible label tuple used by the lazy transition iterators.
 using SymbolTuple = std::vector<mata::Symbol>;
 
 /**

@@ -5,35 +5,98 @@
 
 #pragma once
 
+#include "alphabet_store.hh"
+#include "symbols.hh"
 #include "subsumption.hh"
-#include "transition_cache.hh"
 
 #include <memory>
 #include <optional>
 
 namespace mata::nft::lazy::detail {
 
+/// One generated successor macrostate paired with its acceptance flag.
+struct GeneratedMacroState {
+    MacroStateId id;
+    bool accepting;
+};
+
 /// Abstract iterator over generated initial macrostates.
 struct InitialStateIterator;
-/// Abstract iterator over generated successor macrostates.
-struct NextStateIterator;
-/// Generic label iterator over full visible tuples.
-struct LabelIterator;
-/// Abstract iterator over arity-1 visible labels.
-struct Arity1LabelIterator;
-/// Abstract iterator over packed arity-2 visible labels.
-struct Arity2LabelIterator;
+/// Abstract iterator over visible outgoing transitions.
+struct TransitionIterator;
 
 /// Owning pointer to an initial-state iterator.
 using InitialStateIteratorPtr = std::unique_ptr<InitialStateIterator>;
-/// Owning pointer to a next-state iterator.
-using NextStateIteratorPtr = std::unique_ptr<NextStateIterator>;
-/// Owning pointer to a generic tuple-label iterator.
-using LabelIteratorPtr = std::unique_ptr<LabelIterator>;
-/// Owning pointer to an arity-1 label iterator.
-using Arity1LabelIteratorPtr = std::unique_ptr<Arity1LabelIterator>;
-/// Owning pointer to an arity-2 label iterator.
-using Arity2LabelIteratorPtr = std::unique_ptr<Arity2LabelIterator>;
+/// Owning pointer to a transition iterator.
+using TransitionIteratorPtr = std::unique_ptr<TransitionIterator>;
+
+/**
+ * @brief Internal sync-plan form with precomputed per-level peer lookup.
+ */
+struct CompiledSyncPlan {
+    std::vector<uint8_t> lhs_sync_levels{};
+    std::vector<uint8_t> rhs_sync_levels{};
+    std::vector<LevelRef> result_layout{};
+    std::vector<int16_t> lhs_sync_peer_by_level{};
+    std::vector<int16_t> rhs_sync_peer_by_level{};
+};
+
+/**
+ * @brief Resolved special symbols cached per exec node and level.
+ */
+struct ResolvedSpecialSymbols {
+    enum Flag : uint8_t {
+        HasEpsilon = 1U << 0,
+        HasDontCare = 1U << 1,
+    };
+
+    mata::Symbol epsilon{};
+    mata::Symbol dont_care{};
+    uint8_t flags{0};
+};
+
+/**
+ * @brief Shared tuple-compatibility helper used by transition iterators.
+ */
+class TransitionTupleHelper {
+public:
+    /// Construct the helper over one reconstructed exec DAG.
+    TransitionTupleHelper(const std::vector<ExecNode>& nodes, const AlphabetStore& alphabets);
+
+    /// Merge two visible tuples according to wildcard and epsilon semantics.
+    bool merge_visible_tuples(
+            NodeId lhs_node_id, const SymbolTuple& lhs_tuple, NodeId rhs_node_id, const SymbolTuple& rhs_tuple,
+            SymbolTuple& merged_tuple);
+
+    /// Build one visible sync-product tuple when the synchronized levels are compatible.
+    bool build_visible_sync_result(
+            NodeId lhs_node_id, const SymbolTuple& lhs_tuple, NodeId rhs_node_id, const SymbolTuple& rhs_tuple,
+            const CompiledSyncPlan& plan, SymbolTuple& result_tuple);
+
+private:
+    const std::vector<ExecNode>& nodes;
+    const AlphabetStore& alphabets;
+    std::vector<std::vector<ResolvedSpecialSymbols>> special_symbols_by_level;
+
+    void initialize_special_symbol_cache();
+    std::optional<mata::Symbol> resolve_special_symbol_id(NodeId node_id, uint8_t level, mata::Symbol special_symbol) const;
+    bool is_resolved_epsilon(NodeId node_id, uint8_t level, mata::Symbol resolved_symbol) const;
+    bool is_resolved_dont_care(NodeId node_id, uint8_t level, mata::Symbol resolved_symbol) const;
+    bool is_resolved_special_symbol(
+            NodeId node_id, uint8_t level, mata::Symbol resolved_symbol, mata::Symbol special_symbol) const;
+    bool try_merge_symbols(
+            NodeId lhs_node_id, uint8_t lhs_level, mata::Symbol lhs_symbol, NodeId rhs_node_id, uint8_t rhs_level,
+            mata::Symbol rhs_symbol, mata::Symbol& merged_symbol) const;
+    bool try_merge_tuples(
+            NodeId lhs_node_id, const SymbolTuple& lhs_tuple, NodeId rhs_node_id, const SymbolTuple& rhs_tuple,
+            SymbolTuple& merged_tuple) const;
+    bool sync_levels_match(
+            NodeId lhs_node_id, const SymbolTuple& lhs_tuple, const std::vector<uint8_t>& lhs_levels,
+            NodeId rhs_node_id, const SymbolTuple& rhs_tuple, const std::vector<uint8_t>& rhs_levels) const;
+    bool build_sync_result_tuple(
+            NodeId lhs_node_id, const SymbolTuple& lhs_tuple, NodeId rhs_node_id, const SymbolTuple& rhs_tuple,
+            const CompiledSyncPlan& plan, SymbolTuple& result_tuple) const;
+};
 
 /**
  * @brief Iterator-facing services provided by the lazy emptiness context.
@@ -44,11 +107,10 @@ struct IteratorContext {
 
     /// Access the macrostate store used for interning generated states.
     virtual MacroStateStore& macro_store_ref() = 0;
+    /// Build an iterator over outgoing visible transitions of one node/state pair.
+    virtual TransitionIteratorPtr make_transition_iterator(NodeId node_id, MacroStateId state) = 0;
     /// Build an iterator over initial macrostates of @p node_id.
     virtual InitialStateIteratorPtr make_initial_state_iterator(NodeId node_id) = 0;
-    /// Build an iterator over successors of one exact visible tuple.
-    virtual NextStateIteratorPtr
-    make_next_state_iterator(NodeId node_id, MacroStateId state, const SymbolTuple& tuple) = 0;
 };
 
 /**
@@ -66,50 +128,26 @@ struct InitialStateIterator {
 };
 
 /**
- * @brief Polymorphic iterator over successor macrostates.
+ * @brief One generated visible transition paired with its successor macrostate.
  */
-struct NextStateIterator {
+struct GeneratedTransition {
+    SymbolTuple tuple;
+    GeneratedMacroState state;
+};
+
+/**
+ * @brief Polymorphic iterator over outgoing visible transitions.
+ */
+struct TransitionIterator {
     IteratorContext& ctx;
 
     /// Bind the iterator to the owning context.
-    explicit NextStateIterator(IteratorContext& context) : ctx{context} {}
+    explicit TransitionIterator(IteratorContext& context) : ctx{context} {}
     /// Virtual destructor for polymorphic use.
-    virtual ~NextStateIterator() = default;
-    /// Return the next generated successor macrostate, or `std::nullopt` when exhausted.
-    virtual std::optional<GeneratedMacroState> next() = 0;
+    virtual ~TransitionIterator() = default;
+    /// Return the next generated transition, or `std::nullopt` when exhausted.
+    virtual std::optional<GeneratedTransition> next() = 0;
 };
-
-/**
- * @brief Polymorphic iterator over generic visible label tuples.
- */
-struct LabelIterator {
-    /// Virtual destructor for polymorphic use.
-    virtual ~LabelIterator() = default;
-    /// Return the next visible tuple, or `std::nullopt` when exhausted.
-    virtual std::optional<SymbolTuple> next() = 0;
-};
-
-/**
- * @brief Polymorphic iterator over arity-1 visible labels.
- */
-struct Arity1LabelIterator {
-    /// Virtual destructor for polymorphic use.
-    virtual ~Arity1LabelIterator() = default;
-    /// Return the next visible symbol, or `std::nullopt` when exhausted.
-    virtual std::optional<mata::Symbol> next() = 0;
-};
-
-/**
- * @brief Polymorphic iterator over packed arity-2 visible labels.
- */
-struct Arity2LabelIterator {
-    /// Virtual destructor for polymorphic use.
-    virtual ~Arity2LabelIterator() = default;
-    /// Return the next packed arity-2 tuple, or `std::nullopt` when exhausted.
-    virtual std::optional<Arity2TransitionKey> next() = 0;
-};
-
-// Generic initial-state iterators.
 
 /// Build an iterator over initial states of an NFA leaf.
 InitialStateIteratorPtr make_leaf_nfa_initial_state_iterator(IteratorContext& context, const mata::nfa::Nfa& automaton);
@@ -130,37 +168,38 @@ InitialStateIteratorPtr make_complement_initial_state_iterator(
 InitialStateIteratorPtr
 make_passthrough_initial_state_iterator(IteratorContext& context, InitialStateIteratorPtr child_initial_iter);
 
-// Generic next-state iterators.
-
-/// Wrap an already materialized successor list as an iterator.
-NextStateIteratorPtr
-make_buffered_next_state_iterator(IteratorContext& context, std::vector<GeneratedMacroState> generated_states);
-/// Build a lazy successor iterator for complement states.
-NextStateIteratorPtr make_complement_next_state_iterator(
+/// Build an iterator over visible transitions of an NFA leaf.
+TransitionIteratorPtr make_leaf_nfa_transition_iterator(
+        IteratorContext& context, const mata::nfa::Nfa& automaton, const AlphabetStore& alphabet_store,
+        NodeId node_id, MacroStateId state);
+/// Build an iterator over visible transitions of an NFT leaf.
+TransitionIteratorPtr make_leaf_nft_transition_iterator(
+        IteratorContext& context, const mata::nft::Nft& automaton, const AlphabetStore& alphabet_store,
+        NodeId node_id, MacroStateId state, size_t result_arity);
+/// Build an iterator that replays already materialized transitions from a cache entry.
+TransitionIteratorPtr
+make_buffered_transition_iterator(IteratorContext& context, const std::vector<GeneratedTransition>& transitions);
+/// Build an iterator that retags child transitions for a union node.
+TransitionIteratorPtr make_union_transition_iterator(
+        IteratorContext& context, NodeId node_id, TaggedState::Tag branch_tag,
+        TransitionIteratorPtr child_transition_iter);
+/// Build an iterator that duplicates the single visible level of an identity node.
+TransitionIteratorPtr
+make_identity_transition_iterator(IteratorContext& context, TransitionIteratorPtr child_transition_iter);
+/// Build an iterator that projects away removed levels from child transitions.
+TransitionIteratorPtr make_project_transition_iterator(
+        IteratorContext& context, const ProjectPlan& project_plan, TransitionIteratorPtr child_transition_iter);
+/// Build an iterator over visible transitions of an intersection node.
+TransitionIteratorPtr make_intersect_transition_iterator(
+        IteratorContext& context, TransitionTupleHelper& tuple_helper, NodeId node_id, NodeId lhs_id,
+        MacroStateId lhs_state, NodeId rhs_id, MacroStateId rhs_state);
+/// Build an iterator over visible transitions of a sync-product node.
+TransitionIteratorPtr make_sync_product_transition_iterator(
+        IteratorContext& context, TransitionTupleHelper& tuple_helper, NodeId node_id, NodeId lhs_id,
+        MacroStateId lhs_state, NodeId rhs_id, MacroStateId rhs_state, const CompiledSyncPlan& compiled_plan);
+/// Build an iterator over visible transitions of a complement node.
+TransitionIteratorPtr make_complement_transition_iterator(
         IteratorContext& context, NodeId node_id, NodeId child_id, const SetState& child_states,
-        SymbolTuple transition_tuple, SubsumptionEngine& subsumption);
-
-// Generic label iterators.
-
-/// Build a tuple-label iterator over a materialized transition table.
-LabelIteratorPtr make_transition_label_iterator(const TransitionMap& transitions);
-/// Build a tuple-label iterator over the full visible universe of each level.
-LabelIteratorPtr make_universe_label_iterator(std::vector<std::vector<mata::Symbol>> level_symbols);
-
-// Fast path: arity-1 label iterators.
-
-/// Build an arity-1 label iterator over a materialized arity-1 table.
-Arity1LabelIteratorPtr make_arity1_transition_label_iterator(const Arity1TransitionMap& transitions);
-/// Build an arity-1 label iterator over a fixed symbol list.
-Arity1LabelIteratorPtr make_symbol_label_iterator(std::vector<mata::Symbol> symbols);
-/// Adapt a tuple-label iterator to arity-1 labels.
-Arity1LabelIteratorPtr make_tuple_to_arity1_label_iterator(LabelIteratorPtr child_iterator);
-
-// Fast path: arity-2 label iterators.
-
-/// Build an arity-2 label iterator over a materialized arity-2 table.
-Arity2LabelIteratorPtr make_arity2_transition_label_iterator(const Arity2TransitionMap& transitions);
-/// Adapt a tuple-label iterator to packed arity-2 labels.
-Arity2LabelIteratorPtr make_tuple_to_arity2_label_iterator(LabelIteratorPtr child_iterator);
+        SubsumptionEngine& subsumption, std::vector<std::vector<mata::Symbol>> symbols_per_level);
 
 } // namespace mata::nft::lazy::detail
