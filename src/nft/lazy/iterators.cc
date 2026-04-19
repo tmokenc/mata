@@ -5,11 +5,143 @@
 
 #include "iterators.hh"
 
+#include <algorithm>
 #include <cassert>
+#include <limits>
 #include <stdexcept>
 #include <utility>
+#include <version>
 
 namespace mata::nft::lazy::detail {
+
+namespace {
+    constexpr size_t kComplementIndexedSweepThreshold = 256;
+
+    template<typename Item, typename IteratorPtr>
+    class ReplayBuffer {
+    public:
+        ReplayBuffer() = default;
+
+        explicit ReplayBuffer(IteratorPtr iterator) : live_iterator{std::move(iterator)}, replayed_items{} {}
+
+        const Item* next() {
+            // Keep the first full pass so product-style iterators can replay the RHS
+            // for each new LHS item without rebuilding the child iterator.
+            if (replay_index < replayed_items.size()) {
+                return &replayed_items[replay_index++];
+            }
+
+            if (replay_complete || live_iterator == nullptr) {
+                return nullptr;
+            }
+
+            const std::optional<Item> item = live_iterator->next();
+            if (!item.has_value()) {
+                live_iterator.reset();
+                replay_complete = true;
+                return nullptr;
+            }
+
+            replayed_items.push_back(std::move(*item));
+            replay_index = replayed_items.size();
+            return &replayed_items.back();
+        }
+
+        void rewind() { replay_index = 0; }
+
+    private:
+        IteratorPtr live_iterator{};
+        std::vector<Item> replayed_items{};
+        size_t replay_index{0};
+        bool replay_complete{false};
+    };
+
+    template<typename Item, typename IteratorPtr>
+    class ReplayJoinCursor {
+    public:
+        ReplayJoinCursor(IteratorPtr lhs_iterator, IteratorPtr rhs_iterator)
+            : lhs_iter{std::move(lhs_iterator)}, rhs_items{std::move(rhs_iterator)}, current_lhs{} {
+            advance_lhs();
+        }
+
+        const Item* lhs() const { return current_lhs.has_value() ? &*current_lhs : nullptr; }
+
+        const Item* next_rhs() { return rhs_items.next(); }
+
+        bool advance_lhs() {
+            // The cursor always exposes one fixed LHS item together with a replayable
+            // sweep over all RHS items before it advances the LHS side.
+            current_lhs = lhs_iter->next();
+            if (!current_lhs.has_value()) {
+                return false;
+            }
+
+            rhs_items.rewind();
+            return true;
+        }
+
+    private:
+        IteratorPtr lhs_iter;
+        ReplayBuffer<Item, IteratorPtr> rhs_items;
+        std::optional<Item> current_lhs;
+    };
+
+    template<typename Mapper>
+    class MappedTransitionIterator final : public TransitionIterator {
+    public:
+        MappedTransitionIterator(IteratorContext& context, TransitionIteratorPtr child_transition_iter, Mapper mapper)
+            : TransitionIterator{context}, child_iter{std::move(child_transition_iter)}, map{std::move(mapper)} {}
+
+        std::optional<GeneratedTransition> next() override {
+            const std::optional<GeneratedTransition> child_transition = child_iter->next();
+            if (!child_transition.has_value()) {
+                return std::nullopt;
+            }
+
+            return map(this->ctx, *child_transition);
+        }
+
+    private:
+        TransitionIteratorPtr child_iter;
+        Mapper map;
+    };
+
+    template<typename Mapper>
+    TransitionIteratorPtr make_mapped_transition_iterator(
+            IteratorContext& context, TransitionIteratorPtr child_transition_iter, Mapper mapper) {
+        return std::make_unique<MappedTransitionIterator<Mapper>>(
+                context, std::move(child_transition_iter), std::move(mapper));
+    }
+
+    // TODO: replace this with `std::mul_sat` when compile for C++26
+    //       Currently Mata is compiled with C++20
+    size_t saturating_multiply(const size_t lhs, const size_t rhs) noexcept {
+        if (lhs == 0 || rhs == 0) {
+            return 0;
+        }
+
+        constexpr size_t kMax = std::numeric_limits<size_t>::max();
+        if (lhs > kMax / rhs) {
+            return kMax;
+        }
+
+        return lhs * rhs;
+    }
+
+    size_t estimate_complement_tuple_sweep_cost(
+            const std::vector<std::vector<mata::Symbol>>& level_symbols, const size_t child_state_count) noexcept {
+        size_t universe_size = 1;
+        for (const auto& symbols : level_symbols) {
+            if (symbols.empty()) {
+                return 0;
+            }
+            universe_size = saturating_multiply(universe_size, symbols.size());
+        }
+
+        return saturating_multiply(universe_size, std::max<size_t>(child_state_count, 1));
+    }
+
+} // namespace
 
 TransitionTupleHelper::TransitionTupleHelper(
         const std::vector<ExecNode>& exec_nodes, const AlphabetStore& alphabet_store)
@@ -253,45 +385,28 @@ namespace {
 
     struct ProductInitialStateIterator final : InitialStateIterator {
         const NodeId parent_id;
-        const NodeId rhs_id;
-        InitialStateIteratorPtr lhs_iter;
-        InitialStateIteratorPtr rhs_iter;
-        std::optional<GeneratedMacroState> current_lhs;
+        ReplayJoinCursor<GeneratedMacroState, InitialStateIteratorPtr> state_pairs;
 
         ProductInitialStateIterator(
                 IteratorContext& context, const NodeId node_id, const NodeId next_rhs_id,
                 InitialStateIteratorPtr lhs_initial_iter)
-            : InitialStateIterator{context}, parent_id{node_id}, rhs_id{next_rhs_id},
-              lhs_iter{std::move(lhs_initial_iter)}, rhs_iter{}, current_lhs{} {
-            advance_lhs();
-        }
+            : InitialStateIterator{context}, parent_id{node_id},
+              state_pairs{std::move(lhs_initial_iter), this->ctx.make_initial_state_iterator(next_rhs_id)} {}
 
         std::optional<GeneratedMacroState> next() override {
-            while (current_lhs.has_value()) {
-                if (const std::optional<GeneratedMacroState> rhs_state = rhs_iter->next(); rhs_state.has_value()) {
+            while (const GeneratedMacroState* lhs_state = state_pairs.lhs()) {
+                while (const GeneratedMacroState* rhs_state = state_pairs.next_rhs()) {
                     return GeneratedMacroState{
-                            this->ctx.macro_store_ref().intern(parent_id, PairState{current_lhs->id, rhs_state->id}),
-                            current_lhs->accepting && rhs_state->accepting};
+                            this->ctx.macro_store_ref().intern(parent_id, PairState{lhs_state->id, rhs_state->id}),
+                            lhs_state->accepting && rhs_state->accepting};
                 }
 
-                if (!advance_lhs()) {
+                if (!state_pairs.advance_lhs()) {
                     break;
                 }
             }
 
             return std::nullopt;
-        }
-
-    private:
-        bool advance_lhs() {
-            current_lhs = lhs_iter->next();
-            if (!current_lhs.has_value()) {
-                rhs_iter.reset();
-                return false;
-            }
-
-            rhs_iter = this->ctx.make_initial_state_iterator(rhs_id);
-            return true;
         }
     };
 
@@ -404,56 +519,84 @@ namespace {
 
         std::optional<GeneratedTransition> next() override {
             if (arity == 0) {
-                if (emitted_empty) {
-                    return std::nullopt;
-                }
-                emitted_empty = true;
-                return GeneratedTransition{
-                        SymbolTuple{},
-                        GeneratedMacroState{static_cast<MacroStateId>(source_state), nft.final.contains(source_state)}};
+                return next_empty_transition();
             }
 
-            if (!initialized) {
-                initialized = true;
-                push_frame(source_state);
-            }
-
-            while (!frames.empty()) {
-                const size_t level = frames.size() - 1;
-                Frame& frame = frames.back();
-                if (frame.current == frame.end) {
-                    frames.pop_back();
-                    if (!frames.empty()) {
-                        ++frames.back().current;
-                    }
-                    continue;
+            // `frames` and `current_tuple` encode one DFS path through the per-level
+            // NFT relation. Each emitted transition is the currently completed path.
+            initialize_once();
+            while (skip_exhausted_frames()) {
+                if (const std::optional<GeneratedTransition> transition = try_emit_current_transition()) {
+                    return transition;
                 }
-
-                const mata::nfa::Move move = *frame.current;
-                mata::Symbol resolved_symbol = 0;
-                if (!alphabets.try_translate_local_symbol_to_resolved(
-                            nft, static_cast<uint8_t>(level), node_id, static_cast<uint8_t>(level), move.symbol,
-                            resolved_symbol)) {
-                    ++frame.current;
-                    continue;
-                }
-
-                current_tuple[level] = resolved_symbol;
-                if (frames.size() == arity) {
-                    ++frame.current;
-                    return GeneratedTransition{
-                            current_tuple,
-                            GeneratedMacroState{
-                                    static_cast<MacroStateId>(move.target), nft.final.contains(move.target)}};
-                }
-
-                push_frame(move.target);
             }
 
             return std::nullopt;
         }
 
     private:
+        std::optional<GeneratedTransition> next_empty_transition() {
+            if (emitted_empty) {
+                return std::nullopt;
+            }
+
+            emitted_empty = true;
+            return GeneratedTransition{
+                    SymbolTuple{},
+                    GeneratedMacroState{static_cast<MacroStateId>(source_state), nft.final.contains(source_state)}};
+        }
+
+        void initialize_once() {
+            if (!initialized) {
+                initialized = true;
+                push_frame(source_state);
+            }
+        }
+
+        bool skip_exhausted_frames() {
+            // Backtrack until the current level still has an unexplored move.
+            while (!frames.empty() && frames.back().current == frames.back().end) {
+                frames.pop_back();
+                if (!frames.empty()) {
+                    ++frames.back().current;
+                }
+            }
+
+            return !frames.empty();
+        }
+
+        std::optional<GeneratedTransition> try_emit_current_transition() {
+            const size_t level = frames.size() - 1;
+            Frame& frame = frames.back();
+            const mata::nfa::Move move = *frame.current;
+
+            mata::Symbol resolved_symbol = 0;
+            if (!try_translate_symbol(level, move.symbol, resolved_symbol)) {
+                // Skip untranslatable moves while keeping the current DFS path alive.
+                ++frame.current;
+                return std::nullopt;
+            }
+
+            current_tuple[level] = resolved_symbol;
+            if (frames.size() == arity) {
+                // We have completed a full path through the NFT relation, so emit the current tuple and backtrack.
+                ++frame.current;
+                return GeneratedTransition{
+                        current_tuple,
+                        GeneratedMacroState{static_cast<MacroStateId>(move.target), nft.final.contains(move.target)}};
+            }
+
+            push_frame(move.target);
+            return std::nullopt;
+        }
+
+        bool
+        try_translate_symbol(const size_t level, const mata::Symbol local_symbol, mata::Symbol& resolved_symbol) const {
+            return alphabets.try_translate_local_symbol_to_resolved(
+                    nft, static_cast<uint8_t>(level), node_id, static_cast<uint8_t>(level), local_symbol,
+                    resolved_symbol);
+        }
+
         void push_frame(const mata::nfa::State state) { frames.emplace_back(nft.delta.state_post(state)); }
     };
 
@@ -474,99 +617,30 @@ namespace {
         }
     };
 
-    struct UnionTransitionIterator final : TransitionIterator {
-        const NodeId parent_id;
-        const TaggedState::Tag tag;
-        TransitionIteratorPtr child_iter;
-
-        UnionTransitionIterator(
-                IteratorContext& context, const NodeId node_id, const TaggedState::Tag branch_tag,
-                TransitionIteratorPtr child_transition_iter)
-            : TransitionIterator{context}, parent_id{node_id}, tag{branch_tag},
-              child_iter{std::move(child_transition_iter)} {}
-
-        std::optional<GeneratedTransition> next() override {
-            const std::optional<GeneratedTransition> child_transition = child_iter->next();
-            if (!child_transition.has_value()) {
-                return std::nullopt;
-            }
-
-            return GeneratedTransition{
-                    child_transition->tuple,
-                    GeneratedMacroState{
-                            this->ctx.macro_store_ref().intern(parent_id, TaggedState{child_transition->state.id, tag}),
-                            child_transition->state.accepting}};
-        }
-    };
-
-    struct IdentityTransitionIterator final : TransitionIterator {
-        TransitionIteratorPtr child_iter;
-
-        IdentityTransitionIterator(IteratorContext& context, TransitionIteratorPtr child_transition_iter)
-            : TransitionIterator{context}, child_iter{std::move(child_transition_iter)} {}
-
-        std::optional<GeneratedTransition> next() override {
-            const std::optional<GeneratedTransition> child_transition = child_iter->next();
-            if (!child_transition.has_value()) {
-                return std::nullopt;
-            }
-
-            assert(child_transition->tuple.size() == 1);
-            return GeneratedTransition{
-                    SymbolTuple{child_transition->tuple[0], child_transition->tuple[0]}, child_transition->state};
-        }
-    };
-
-    struct ProjectTransitionIterator final : TransitionIterator {
-        const ProjectPlan& plan;
-        TransitionIteratorPtr child_iter;
-
-        ProjectTransitionIterator(
-                IteratorContext& context, const ProjectPlan& project_plan, TransitionIteratorPtr child_transition_iter)
-            : TransitionIterator{context}, plan{project_plan}, child_iter{std::move(child_transition_iter)} {}
-
-        std::optional<GeneratedTransition> next() override {
-            const std::optional<GeneratedTransition> child_transition = child_iter->next();
-            if (!child_transition.has_value()) {
-                return std::nullopt;
-            }
-
-            SymbolTuple projected{};
-            projected.reserve(plan.kept_levels.size());
-            for (const uint8_t level : plan.kept_levels) {
-                projected.push_back(child_transition->tuple[level]);
-            }
-
-            return GeneratedTransition{std::move(projected), child_transition->state};
-        }
-    };
 
     struct IntersectTransitionIterator final : TransitionIterator {
         TransitionTupleHelper& transition_tuple_helper;
         const NodeId parent_id;
         const NodeId lhs_id;
         const NodeId rhs_id;
-        const MacroStateId rhs_state;
-        TransitionIteratorPtr lhs_iter;
-        TransitionIteratorPtr rhs_iter;
-        std::optional<GeneratedTransition> current_lhs;
+        ReplayJoinCursor<GeneratedTransition, TransitionIteratorPtr> transition_pairs;
 
         IntersectTransitionIterator(
                 IteratorContext& context, TransitionTupleHelper& tuple_helper, const NodeId node_id,
                 const NodeId next_lhs_id, const MacroStateId lhs_state, const NodeId next_rhs_id,
                 const MacroStateId next_rhs_state)
             : TransitionIterator{context}, transition_tuple_helper{tuple_helper}, parent_id{node_id},
-              lhs_id{next_lhs_id}, rhs_id{next_rhs_id}, rhs_state{next_rhs_state},
-              lhs_iter{this->ctx.make_transition_iterator(lhs_id, lhs_state)}, rhs_iter{}, current_lhs{} {
-            advance_lhs();
-        }
+              lhs_id{next_lhs_id}, rhs_id{next_rhs_id},
+              transition_pairs{
+                      this->ctx.make_transition_iterator(lhs_id, lhs_state),
+                      this->ctx.make_transition_iterator(next_rhs_id, next_rhs_state)} {}
 
         std::optional<GeneratedTransition> next() override {
-            while (current_lhs.has_value()) {
-                while (const std::optional<GeneratedTransition> rhs_transition = rhs_iter->next()) {
+            while (const GeneratedTransition* lhs_transition = transition_pairs.lhs()) {
+                while (const GeneratedTransition* rhs_transition = transition_pairs.next_rhs()) {
                     SymbolTuple merged_tuple{};
                     if (!transition_tuple_helper.merge_visible_tuples(
-                                lhs_id, current_lhs->tuple, rhs_id, rhs_transition->tuple, merged_tuple)) {
+                                lhs_id, lhs_transition->tuple, rhs_id, rhs_transition->tuple, merged_tuple)) {
                         continue;
                     }
 
@@ -574,28 +648,16 @@ namespace {
                             std::move(merged_tuple),
                             GeneratedMacroState{
                                     this->ctx.macro_store_ref().intern(
-                                            parent_id, PairState{current_lhs->state.id, rhs_transition->state.id}),
-                                    current_lhs->state.accepting && rhs_transition->state.accepting}};
+                                            parent_id, PairState{lhs_transition->state.id, rhs_transition->state.id}),
+                                    lhs_transition->state.accepting && rhs_transition->state.accepting}};
                 }
 
-                if (!advance_lhs()) {
+                if (!transition_pairs.advance_lhs()) {
                     break;
                 }
             }
 
             return std::nullopt;
-        }
-
-    private:
-        bool advance_lhs() {
-            current_lhs = lhs_iter->next();
-            if (!current_lhs.has_value()) {
-                rhs_iter.reset();
-                return false;
-            }
-
-            rhs_iter = this->ctx.make_transition_iterator(rhs_id, rhs_state);
-            return true;
         }
     };
 
@@ -604,28 +666,25 @@ namespace {
         const NodeId parent_id;
         const NodeId lhs_id;
         const NodeId rhs_id;
-        const MacroStateId rhs_state;
         const CompiledSyncPlan& plan;
-        TransitionIteratorPtr lhs_iter;
-        TransitionIteratorPtr rhs_iter;
-        std::optional<GeneratedTransition> current_lhs;
+        ReplayJoinCursor<GeneratedTransition, TransitionIteratorPtr> transition_pairs;
 
         SyncProductTransitionIterator(
                 IteratorContext& context, TransitionTupleHelper& tuple_helper, const NodeId node_id,
                 const NodeId next_lhs_id, const MacroStateId lhs_state, const NodeId next_rhs_id,
                 const MacroStateId next_rhs_state, const CompiledSyncPlan& compiled_plan)
             : TransitionIterator{context}, transition_tuple_helper{tuple_helper}, parent_id{node_id},
-              lhs_id{next_lhs_id}, rhs_id{next_rhs_id}, rhs_state{next_rhs_state}, plan{compiled_plan},
-              lhs_iter{this->ctx.make_transition_iterator(lhs_id, lhs_state)}, rhs_iter{}, current_lhs{} {
-            advance_lhs();
-        }
+              lhs_id{next_lhs_id}, rhs_id{next_rhs_id}, plan{compiled_plan},
+              transition_pairs{
+                      this->ctx.make_transition_iterator(lhs_id, lhs_state),
+                      this->ctx.make_transition_iterator(next_rhs_id, next_rhs_state)} {}
 
         std::optional<GeneratedTransition> next() override {
-            while (current_lhs.has_value()) {
-                while (const std::optional<GeneratedTransition> rhs_transition = rhs_iter->next()) {
+            while (const GeneratedTransition* lhs_transition = transition_pairs.lhs()) {
+                while (const GeneratedTransition* rhs_transition = transition_pairs.next_rhs()) {
                     SymbolTuple result_tuple{};
                     if (!transition_tuple_helper.build_visible_sync_result(
-                                lhs_id, current_lhs->tuple, rhs_id, rhs_transition->tuple, plan, result_tuple)) {
+                                lhs_id, lhs_transition->tuple, rhs_id, rhs_transition->tuple, plan, result_tuple)) {
                         continue;
                     }
 
@@ -633,39 +692,34 @@ namespace {
                             std::move(result_tuple),
                             GeneratedMacroState{
                                     this->ctx.macro_store_ref().intern(
-                                            parent_id, PairState{current_lhs->state.id, rhs_transition->state.id}),
-                                    current_lhs->state.accepting && rhs_transition->state.accepting}};
+                                            parent_id, PairState{lhs_transition->state.id, rhs_transition->state.id}),
+                                    lhs_transition->state.accepting && rhs_transition->state.accepting}};
                 }
 
-                if (!advance_lhs()) {
+                if (!transition_pairs.advance_lhs()) {
                     break;
                 }
             }
 
             return std::nullopt;
         }
-
-    private:
-        bool advance_lhs() {
-            current_lhs = lhs_iter->next();
-            if (!current_lhs.has_value()) {
-                rhs_iter.reset();
-                return false;
-            }
-
-            rhs_iter = this->ctx.make_transition_iterator(rhs_id, rhs_state);
-            return true;
-        }
     };
 
     struct ComplementTransitionIterator final : TransitionIterator {
+        struct IndexedChildTransitions {
+            std::vector<GeneratedTransition> transitions;
+            size_t next_index{0};
+        };
+
         const NodeId parent_id;
         const NodeId child_id;
         const SetState& sub_states;
         SubsumptionEngine& subsumption;
         const std::vector<std::vector<mata::Symbol>>& level_symbols;
+        std::vector<IndexedChildTransitions> indexed_child_transitions;
         std::vector<size_t> indices;
         SymbolTuple current_tuple;
+        bool use_monotonic_child_index;
         bool finished;
 
         ComplementTransitionIterator(
@@ -673,8 +727,12 @@ namespace {
                 const SetState& child_states, SubsumptionEngine& subsumption,
                 const std::vector<std::vector<mata::Symbol>>& symbols_per_level)
             : TransitionIterator{context}, parent_id{node_id}, child_id{next_child_id}, sub_states{child_states},
-              subsumption{subsumption}, level_symbols{symbols_per_level}, indices(level_symbols.size(), 0),
-              current_tuple(level_symbols.size(), 0), finished{false} {
+              subsumption{subsumption}, level_symbols{symbols_per_level}, indexed_child_transitions{},
+              indices(level_symbols.size(), 0), current_tuple(level_symbols.size(), 0),
+              use_monotonic_child_index{
+                      estimate_complement_tuple_sweep_cost(symbols_per_level, child_states.size()) >=
+                      kComplementIndexedSweepThreshold},
+              finished{false} {
             for (size_t level = 0; level < level_symbols.size(); ++level) {
                 if (level_symbols[level].empty()) {
                     finished = true;
@@ -682,6 +740,10 @@ namespace {
                 }
 
                 current_tuple[level] = level_symbols[level][0];
+            }
+
+            if (use_monotonic_child_index) {
+                build_child_transition_index();
             }
         }
 
@@ -697,6 +759,46 @@ namespace {
             next_sub_states.reserve(sub_states.size());
             bool accepting = true;
 
+            collect_matching_successors(tuple, next_sub_states, accepting);
+
+            subsumption.minimize(child_id, next_sub_states);
+            const MacroStateId next_id = this->ctx.macro_store_ref().intern(parent_id, std::move(next_sub_states));
+
+            return GeneratedTransition{tuple, GeneratedMacroState{next_id, accepting}};
+        }
+
+    private:
+        void collect_matching_successors(const SymbolTuple& tuple, SetState& next_sub_states, bool& accepting) {
+            // Complement enumerates tuples in lexicographic order. When the visible
+            // universe is large enough, a monotonic per-child sweep avoids rescanning
+            // already smaller child tuples for every next complement tuple.
+            if (use_monotonic_child_index) {
+                collect_matching_successors_indexed(tuple, next_sub_states, accepting);
+            } else {
+                collect_matching_successors_direct(tuple, next_sub_states, accepting);
+            }
+        }
+
+        void build_child_transition_index() {
+            indexed_child_transitions.reserve(sub_states.size());
+
+            for (const MacroStateId sub_state : sub_states) {
+                IndexedChildTransitions indexed_child{};
+                TransitionIteratorPtr child_iter = this->ctx.make_transition_iterator(child_id, sub_state);
+                while (const std::optional<GeneratedTransition> child_transition = child_iter->next()) {
+                    indexed_child.transitions.push_back(std::move(*child_transition));
+                }
+
+                std::sort(
+                        indexed_child.transitions.begin(), indexed_child.transitions.end(),
+                        [](const GeneratedTransition& lhs, const GeneratedTransition& rhs) {
+                            return lhs.tuple < rhs.tuple;
+                        });
+                indexed_child_transitions.push_back(std::move(indexed_child));
+            }
+        }
+
+        void collect_matching_successors_direct(const SymbolTuple& tuple, SetState& next_sub_states, bool& accepting) {
             for (const MacroStateId sub_state : sub_states) {
                 TransitionIteratorPtr child_iter = this->ctx.make_transition_iterator(child_id, sub_state);
                 while (const std::optional<GeneratedTransition> child_transition = child_iter->next()) {
@@ -708,14 +810,28 @@ namespace {
                     accepting = accepting && !child_transition->state.accepting;
                 }
             }
-
-            subsumption.minimize(child_id, next_sub_states);
-            const MacroStateId next_id = this->ctx.macro_store_ref().intern(parent_id, std::move(next_sub_states));
-
-            return GeneratedTransition{tuple, GeneratedMacroState{next_id, accepting}};
         }
 
-    private:
+        void collect_matching_successors_indexed(const SymbolTuple& tuple, SetState& next_sub_states, bool& accepting) {
+            for (IndexedChildTransitions& indexed_child : indexed_child_transitions) {
+                while (indexed_child.next_index < indexed_child.transitions.size() &&
+                       indexed_child.transitions[indexed_child.next_index].tuple < tuple) {
+                    ++indexed_child.next_index;
+                }
+
+                size_t match_index = indexed_child.next_index;
+                while (match_index < indexed_child.transitions.size() &&
+                       !(tuple < indexed_child.transitions[match_index].tuple) &&
+                       !(indexed_child.transitions[match_index].tuple < tuple)) {
+                    next_sub_states.push_back(indexed_child.transitions[match_index].state.id);
+                    accepting = accepting && !indexed_child.transitions[match_index].state.accepting;
+                    ++match_index;
+                }
+
+                indexed_child.next_index = match_index;
+            }
+        }
+
         void advance_tuple() {
             for (size_t level = indices.size(); level-- > 0;) {
                 if (++indices[level] < level_symbols[level].size()) {
@@ -789,17 +905,42 @@ make_buffered_transition_iterator(IteratorContext& context, const std::vector<Ge
 TransitionIteratorPtr make_union_transition_iterator(
         IteratorContext& context, const NodeId node_id, const TaggedState::Tag branch_tag,
         TransitionIteratorPtr child_transition_iter) {
-    return std::make_unique<UnionTransitionIterator>(context, node_id, branch_tag, std::move(child_transition_iter));
+    return make_mapped_transition_iterator(
+            context, std::move(child_transition_iter),
+            [node_id, branch_tag](IteratorContext& iterator_context, const GeneratedTransition& child_transition) {
+                return GeneratedTransition{
+                        child_transition.tuple,
+                        GeneratedMacroState{
+                                iterator_context.macro_store_ref().intern(
+                                        node_id, TaggedState{child_transition.state.id, branch_tag}),
+                                child_transition.state.accepting}};
+            });
 }
 
 TransitionIteratorPtr
 make_identity_transition_iterator(IteratorContext& context, TransitionIteratorPtr child_transition_iter) {
-    return std::make_unique<IdentityTransitionIterator>(context, std::move(child_transition_iter));
+    return make_mapped_transition_iterator(
+            context, std::move(child_transition_iter),
+            [](IteratorContext&, const GeneratedTransition& child_transition) {
+                assert(child_transition.tuple.size() == 1);
+                return GeneratedTransition{
+                        SymbolTuple{child_transition.tuple[0], child_transition.tuple[0]}, child_transition.state};
+            });
 }
 
 TransitionIteratorPtr make_project_transition_iterator(
         IteratorContext& context, const ProjectPlan& project_plan, TransitionIteratorPtr child_transition_iter) {
-    return std::make_unique<ProjectTransitionIterator>(context, project_plan, std::move(child_transition_iter));
+    return make_mapped_transition_iterator(
+            context, std::move(child_transition_iter),
+            [&project_plan](IteratorContext&, const GeneratedTransition& child_transition) {
+                SymbolTuple projected{};
+                projected.reserve(project_plan.kept_levels.size());
+                for (const uint8_t level : project_plan.kept_levels) {
+                    projected.push_back(child_transition.tuple[level]);
+                }
+
+                return GeneratedTransition{std::move(projected), child_transition.state};
+            });
 }
 
 TransitionIteratorPtr make_intersect_transition_iterator(
