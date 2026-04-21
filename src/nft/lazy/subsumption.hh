@@ -11,6 +11,7 @@
 #include <mata/simlib/explicit_lts.hh>
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -147,6 +148,13 @@ public:
      */
     bool is_pruned(MacroStateId state) const;
 
+    /**
+     * @brief Print statistics about the current subsumption engine state, size of the antichain, ratio between true and
+     * false subsumption results. Result for local caches and global
+     *
+     **/
+    void print_statistics() const;
+
 private:
     using State = mata::nfa::State;
 
@@ -163,10 +171,38 @@ private:
     std::vector<Simlib::Util::BinaryRelation> precomputed_simulation_nfas;
     /// Precomputed simulation relations for NFT leaves.
     std::vector<Simlib::Util::BinaryRelation> precomputed_simulation_nfts;
-    /// Current antichain of non-subsumed states.
+    /// Current antichain of non-subsumed states (flat view used by is_pruned).
     std::unordered_set<MacroStateId> antichain;
+    /// Antichain bucketed by structural fingerprint to prune incompatible candidates early.
+    std::map<uint32_t, std::vector<MacroStateId>> antichain_buckets;
     /// Per-node subsumption caches.
     std::vector<SubsumptionCache> caches;
+
+    /**
+     * @brief Kind of structural fingerprint used to bucket the antichain.
+     *
+     * Chosen from the root node kind when @c initialize_leaf_simulations is called.
+     * The fingerprint is a cheap necessary condition on subsumption at the root,
+     * letting the antichain scan skip entries that cannot possibly subsume a query.
+     */
+    enum class AntichainFilterKind : uint8_t {
+        /// No structural filter — fall back to scanning every entry.
+        None = 0,
+        /// Root is Union*: fingerprint = TaggedState::Tag (subsumption requires equal tag).
+        Tag,
+        /// Root is Complement*: fingerprint = |SetState| (subsumption reverses subset order).
+        RootSetSize,
+        /// Root is Intersect*/SyncProduct* with a Complement rhs:
+        /// fingerprint = |SetState of pair.rhs|.
+        IntersectRhsSetSize,
+    };
+
+    /// Chosen filter kind for the current root.
+    AntichainFilterKind filter_kind = AntichainFilterKind::None;
+    /// Execution node whose macrostate view is used to compute the fingerprint.
+    NodeId filter_fingerprint_source_node = 0;
+    /// Root exec node used when computing fingerprints.
+    NodeId filter_root_node = 0;
 
     /**
      * @brief Recursive worker for reachable-leaf simulation initialization.
@@ -185,6 +221,18 @@ private:
      * @return True if @p state1 is subsumed by @p state2, false otherwise.
      */
     bool subsumed_state(NodeId node_id, MacroStateId state1, MacroStateId state2);
+
+    /// Choose an antichain filter strategy for the current root.
+    void configure_antichain_filter(NodeId root_id);
+
+    /// Compute the structural fingerprint of @p state under the current filter.
+    uint32_t compute_fingerprint(MacroStateId state) const;
+
+    /// Return true if @p entry_fp could belong to an antichain entry that subsumes a query of fingerprint @p state_fp.
+    bool fingerprint_can_subsume(uint32_t entry_fp, uint32_t state_fp) const noexcept;
+
+    /// Return true if @p entry_fp could belong to an antichain entry that is subsumed by a query of fingerprint @p state_fp.
+    bool fingerprint_can_be_subsumed(uint32_t entry_fp, uint32_t state_fp) const noexcept;
 };
 
 } // namespace mata::nft::lazy::detail

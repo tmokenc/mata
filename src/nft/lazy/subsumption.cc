@@ -25,15 +25,109 @@ void SubsumptionCache::set(MacroStateId state1, MacroStateId state2, bool result
 SubsumptionEngine::SubsumptionEngine(const SubsumptionContext& context)
     : nfas{context.nfas}, nfts{context.nfts}, nodes{context.nodes}, macro_store{context.macro_store},
       precomputed_simulation_nfas(context.nfas.size()), precomputed_simulation_nfts(context.nfts.size()), antichain{},
-      caches{} {}
+      antichain_buckets{}, caches{} {}
 
 void SubsumptionEngine::initialize_leaf_simulations(const NodeId root_id) {
     antichain.clear();
+    antichain_buckets.clear();
     caches.clear();
     caches.resize(nodes.size());
 
+    configure_antichain_filter(root_id);
+
     std::vector<bool> visited(nodes.size(), false);
     initialize_leaf_simulations_impl(root_id, visited);
+}
+
+void SubsumptionEngine::configure_antichain_filter(const NodeId root_id) {
+    filter_root_node = root_id;
+    filter_kind = AntichainFilterKind::None;
+    filter_fingerprint_source_node = root_id;
+
+    if (root_id >= nodes.size()) {
+        return;
+    }
+
+    const ExecKind root_kind = nodes[root_id].kind;
+    switch (root_kind) {
+        case ExecKind::Union:
+        case ExecKind::Arity1Union:
+        case ExecKind::Arity2Union:
+            filter_kind = AntichainFilterKind::Tag;
+            break;
+
+        case ExecKind::Complement:
+        case ExecKind::Arity1Complement:
+        case ExecKind::Arity2Complement:
+            filter_kind = AntichainFilterKind::RootSetSize;
+            break;
+
+        case ExecKind::Intersect:
+        case ExecKind::SyncProduct:
+        case ExecKind::Arity1Intersect:
+        case ExecKind::Arity2Intersect:
+        case ExecKind::Arity2SyncProduct: {
+            const NodeId rhs = nodes[root_id].rhs;
+            if (rhs < nodes.size()) {
+                const ExecKind rhs_kind = nodes[rhs].kind;
+                if (rhs_kind == ExecKind::Complement || rhs_kind == ExecKind::Arity1Complement ||
+                    rhs_kind == ExecKind::Arity2Complement) {
+                    filter_kind = AntichainFilterKind::IntersectRhsSetSize;
+                    filter_fingerprint_source_node = rhs;
+                }
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+uint32_t SubsumptionEngine::compute_fingerprint(const MacroStateId state) const {
+    switch (filter_kind) {
+        case AntichainFilterKind::Tag:
+            return static_cast<uint32_t>(macro_store.get_tagged(filter_root_node, state).tag);
+
+        case AntichainFilterKind::RootSetSize:
+            return static_cast<uint32_t>(macro_store.get_set(filter_root_node, state).size());
+
+        case AntichainFilterKind::IntersectRhsSetSize: {
+            const PairState pair = macro_store.get_pair(filter_root_node, state);
+            return static_cast<uint32_t>(macro_store.get_set(filter_fingerprint_source_node, pair.rhs).size());
+        }
+
+        case AntichainFilterKind::None:
+            break;
+    }
+
+    return 0;
+}
+
+bool SubsumptionEngine::fingerprint_can_subsume(const uint32_t entry_fp, const uint32_t state_fp) const noexcept {
+    switch (filter_kind) {
+        case AntichainFilterKind::Tag:
+            return entry_fp == state_fp;
+        case AntichainFilterKind::RootSetSize:
+        case AntichainFilterKind::IntersectRhsSetSize:
+            return entry_fp <= state_fp;
+        case AntichainFilterKind::None:
+            break;
+    }
+    return true;
+}
+
+bool SubsumptionEngine::fingerprint_can_be_subsumed(const uint32_t entry_fp, const uint32_t state_fp) const noexcept {
+    switch (filter_kind) {
+        case AntichainFilterKind::Tag:
+            return entry_fp == state_fp;
+        case AntichainFilterKind::RootSetSize:
+        case AntichainFilterKind::IntersectRhsSetSize:
+            return entry_fp >= state_fp;
+        case AntichainFilterKind::None:
+            break;
+    }
+    return true;
 }
 
 void SubsumptionEngine::initialize_leaf_simulations_impl(const NodeId node_id, std::vector<bool>& visited) {
@@ -186,16 +280,75 @@ bool SubsumptionEngine::subsumed_state(const NodeId node_id, const MacroStateId 
 }
 
 bool SubsumptionEngine::is_subsumed(const NodeId root_id, const MacroStateId state) {
-    for (const MacroStateId antichain_state : antichain) {
-        if (subsumed_state(root_id, state, antichain_state)) {
-            return true;
+    const uint32_t state_fp = compute_fingerprint(state);
+
+    auto check_subsumption = [&](auto it_begin, auto it_end) {
+        for (auto it = it_begin; it != it_end; ++it) {
+            for (const MacroStateId entry : it->second) {
+                if (subsumed_state(root_id, state, entry)) {
+                    return true;
+                }
+            }
         }
+        return false;
+    };
+
+    switch (filter_kind) {
+        case AntichainFilterKind::Tag:
+            if (auto it = antichain_buckets.find(state_fp); it != antichain_buckets.end()) {
+                if (check_subsumption(it, std::next(it))) {
+                    return true;
+                }
+            }
+            break;
+
+        case AntichainFilterKind::RootSetSize:
+        case AntichainFilterKind::IntersectRhsSetSize:
+            // fingerprint_can_subsume: entry_fp <= state_fp
+            if (check_subsumption(antichain_buckets.begin(), antichain_buckets.upper_bound(state_fp))) {
+                return true;
+            }
+            break;
+
+        case AntichainFilterKind::None:
+            if (check_subsumption(antichain_buckets.begin(), antichain_buckets.end())) {
+                return true;
+            }
+            break;
     }
 
-    std::erase_if(antichain, [&](const MacroStateId antichain_state) {
-        return subsumed_state(root_id, antichain_state, state);
-    });
+    auto remove_subsumed = [&](auto it_begin, auto it_end) {
+        for (auto it = it_begin; it != it_end; ++it) {
+            std::erase_if(it->second, [&](const MacroStateId entry) {
+                if (subsumed_state(root_id, entry, state)) {
+                    antichain.erase(entry);
+                    return true;
+                }
+                return false;
+            });
+        }
+    };
+
+    switch (filter_kind) {
+        case AntichainFilterKind::Tag:
+            if (auto it = antichain_buckets.find(state_fp); it != antichain_buckets.end()) {
+                remove_subsumed(it, std::next(it));
+            }
+            break;
+
+        case AntichainFilterKind::RootSetSize:
+        case AntichainFilterKind::IntersectRhsSetSize:
+            // fingerprint_can_be_subsumed: entry_fp >= state_fp
+            remove_subsumed(antichain_buckets.lower_bound(state_fp), antichain_buckets.end());
+            break;
+
+        case AntichainFilterKind::None:
+            remove_subsumed(antichain_buckets.begin(), antichain_buckets.end());
+            break;
+    }
+
     antichain.insert(state);
+    antichain_buckets[state_fp].push_back(state);
 
     return false;
 }
@@ -228,5 +381,24 @@ void SubsumptionEngine::minimize(const NodeId root_id, SetState& state) {
 }
 
 bool SubsumptionEngine::is_pruned(const MacroStateId state) const { return !antichain.contains(state); }
+
+void SubsumptionEngine::print_statistics() const {
+    size_t cache_stored = 0;
+    size_t cached_true = 0;
+
+    for (const SubsumptionCache& cache : caches) {
+        cache_stored += cache.cache.size();
+        for (const auto& [_, result] : cache.cache) {
+            if (result) {
+                ++cached_true;
+            }
+        }
+    }
+
+    std::cout << "Subsumption cache size: " << cache_stored << std::endl;
+    std::cout << "Subsumption cache true ratio: "
+              << (cache_stored == 0 ? 0 : static_cast<double>(cached_true) / cache_stored) << std::endl;
+    std::cout << "Current antichain size: " << antichain.size() << std::endl;
+}
 
 } // namespace mata::nft::lazy::detail
