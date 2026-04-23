@@ -845,3 +845,327 @@ TEST_CASE("mata::nft::lazy – complement of shared subterm under intersect is n
     CHECK(tree.is_valid(root));
     CHECK_FALSE(tree.is_empty(root));
 }
+
+// ---------------------------------------------------------------------------
+// 11. Reconstruction-time peephole rewrites
+//
+// These tests do not introspect the exec DAG, they only exercise patterns
+// that trigger reconstruction rewrites (idempotence, identity projection,
+// project of identity, identity fusion) via the public API and verify the
+// rewritten formulas still produce the correct emptiness answer.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("mata::nft::lazy – union of a language with itself matches the operand emptiness") {
+    SymbolicFormula tree;
+    const Term a = tree.make_term(single_symbol_nfa('a'));
+    const Term empty = tree.make_term(empty_nfa());
+
+    CHECK_FALSE(tree.is_empty(tree.unite(a, a)));
+    CHECK(tree.is_empty(tree.unite(empty, empty)));
+}
+
+TEST_CASE("mata::nft::lazy – intersect of a language with itself matches the operand emptiness") {
+    SymbolicFormula tree;
+    const Term a = tree.make_term(single_symbol_nfa('a'));
+    const Term empty = tree.make_term(empty_nfa());
+
+    CHECK_FALSE(tree.is_empty(tree.intersect(a, a)));
+    CHECK(tree.is_empty(tree.intersect(empty, empty)));
+}
+
+TEST_CASE("mata::nft::lazy – complement of self-union is the complement of the operand") {
+    // complement(a ∪ a) ≡ complement(a), over alphabet {a} this is empty
+    // because the only word, `a`, lies in the operand.
+    SymbolicFormula tree;
+    const Term a = tree.make_term(universal_nfa('a'));
+    CHECK(tree.is_empty(tree.complement(tree.unite(a, a))));
+}
+
+TEST_CASE("mata::nft::lazy – self-union and self-intersection of an NFT relation stay correct") {
+    SymbolicFormula tree;
+    const Term rel = tree.make_term(relation_single_pair('a', 'b'));
+    CHECK_FALSE(tree.is_empty(tree.intersect(rel, rel)));
+    CHECK_FALSE(tree.is_empty(tree.unite(rel, rel)));
+}
+
+TEST_CASE("mata::nft::lazy – identity projection on arity-1 language is unchanged") {
+    SymbolicFormula tree;
+    const Term a = tree.make_term(single_symbol_nfa('a'));
+    const Term empty = tree.make_term(empty_nfa());
+
+    CHECK_FALSE(tree.is_empty(tree.project(a, {0})));
+    CHECK(tree.is_empty(tree.project(empty, {0})));
+}
+
+TEST_CASE("mata::nft::lazy – identity projection on arity-2 relation is unchanged") {
+    SymbolicFormula tree;
+    const Term rel = tree.make_term(relation_single_pair('a', 'b'));
+    const Term empty = tree.make_term(empty_nft('a', 'b'));
+
+    CHECK_FALSE(tree.is_empty(tree.project(rel, {0, 1})));
+    CHECK(tree.is_empty(tree.project(empty, {0, 1})));
+}
+
+TEST_CASE("mata::nft::lazy – identity projection on arity-3 relation is unchanged") {
+    SymbolicFormula tree;
+    const Term triple = tree.make_term(relation_single_triple('a', 'b', 'c'));
+
+    const Term projected = tree.project(triple, {0, 1, 2});
+    CHECK(tree.arity_of(projected) == 3);
+    CHECK_FALSE(tree.is_empty(projected));
+}
+
+TEST_CASE("mata::nft::lazy – projecting identity to tape 0 yields the language") {
+    SymbolicFormula tree;
+    const Term a = tree.make_term(single_symbol_nfa('a'));
+    const Term diag = tree.identity(a);
+    const Term back_to_a = tree.project(diag, {0});
+
+    CHECK(tree.arity_of(back_to_a) == 1);
+    // Result equals `a`, non-empty, intersecting with `a` is non-empty,
+    // intersecting with a different symbol is empty.
+    CHECK_FALSE(tree.is_empty(back_to_a));
+    CHECK_FALSE(tree.is_empty(tree.intersect(back_to_a, a)));
+    CHECK(tree.is_empty(tree.intersect(back_to_a, tree.make_term(single_symbol_nfa('b')))));
+}
+
+TEST_CASE("mata::nft::lazy – projecting identity to tape 1 yields the language") {
+    SymbolicFormula tree;
+    const Term a = tree.make_term(single_symbol_nfa('a'));
+    const Term diag = tree.identity(a);
+    const Term back_to_a = tree.project(diag, {1});
+
+    CHECK(tree.arity_of(back_to_a) == 1);
+    CHECK_FALSE(tree.is_empty(back_to_a));
+    CHECK_FALSE(tree.is_empty(tree.intersect(back_to_a, a)));
+    CHECK(tree.is_empty(tree.intersect(back_to_a, tree.make_term(single_symbol_nfa('b')))));
+}
+
+TEST_CASE("mata::nft::lazy – projecting identity by [0,1] is still identity") {
+    SymbolicFormula tree;
+    const Term a = tree.make_term(single_symbol_nfa('a'));
+    const Term diag = tree.identity(a);
+    const Term reprojected = tree.project(diag, {0, 1});
+
+    CHECK(tree.arity_of(reprojected) == 2);
+    CHECK_FALSE(tree.is_empty(reprojected));
+    // Diagonal pair (a, a) should match a single-pair relation that is on-diagonal.
+    const Term aa = tree.make_term(relation_single_pair('a', 'a'));
+    CHECK_FALSE(tree.is_empty(tree.intersect(reprojected, aa)));
+    // Off-diagonal pair (a, b) should not match.
+    const Term ab = tree.make_term(relation_single_pair('a', 'b'));
+    CHECK(tree.is_empty(tree.intersect(reprojected, ab)));
+}
+
+TEST_CASE("mata::nft::lazy – projecting identity by [1,0] is still identity by symmetry") {
+    SymbolicFormula tree;
+    const Term a = tree.make_term(single_symbol_nfa('a'));
+    const Term diag = tree.identity(a);
+    const Term swapped = tree.project(diag, {1, 0});
+
+    CHECK(tree.arity_of(swapped) == 2);
+    CHECK_FALSE(tree.is_empty(swapped));
+    const Term aa = tree.make_term(relation_single_pair('a', 'a'));
+    CHECK_FALSE(tree.is_empty(tree.intersect(swapped, aa)));
+    const Term ab = tree.make_term(relation_single_pair('a', 'b'));
+    CHECK(tree.is_empty(tree.intersect(swapped, ab)));
+}
+
+TEST_CASE("mata::nft::lazy – projecting identity of an empty language is empty") {
+    SymbolicFormula tree;
+    const Term empty = tree.make_term(empty_nfa());
+    CHECK(tree.is_empty(tree.project(tree.identity(empty), {0})));
+    CHECK(tree.is_empty(tree.project(tree.identity(empty), {1})));
+    CHECK(tree.is_empty(tree.project(tree.identity(empty), {0, 1})));
+    CHECK(tree.is_empty(tree.project(tree.identity(empty), {1, 0})));
+}
+
+TEST_CASE("mata::nft::lazy – intersect of two identities equals identity of the intersection") {
+    // L1 = {a}, L2 = {a}, L1 ∩ L2 = {a}, identity should match (a, a).
+    SymbolicFormula tree;
+    const Term a = tree.make_term(single_symbol_nfa('a'));
+    const Term a2 = tree.make_term(single_symbol_nfa('a'));
+    const Term fused = tree.intersect(tree.identity(a), tree.identity(a2));
+
+    CHECK(tree.arity_of(fused) == 2);
+    CHECK_FALSE(tree.is_empty(fused));
+    CHECK_FALSE(tree.is_empty(tree.intersect(fused, tree.make_term(relation_single_pair('a', 'a')))));
+    CHECK(tree.is_empty(tree.intersect(fused, tree.make_term(relation_single_pair('a', 'b')))));
+}
+
+TEST_CASE("mata::nft::lazy – intersect of identities of disjoint languages is empty") {
+    // identity({a}) ∩ identity({b}) = identity(∅) = ∅.
+    SymbolicFormula tree;
+    const Term a = tree.make_term(single_symbol_nfa('a'));
+    const Term b = tree.make_term(single_symbol_nfa('b'));
+    CHECK(tree.is_empty(tree.intersect(tree.identity(a), tree.identity(b))));
+}
+
+TEST_CASE("mata::nft::lazy – union of identities preserves diagonal coverage on both sides") {
+    SymbolicFormula tree;
+    const Term a = tree.make_term(single_symbol_nfa('a'));
+    const Term b = tree.make_term(single_symbol_nfa('b'));
+    const Term fused = tree.unite(tree.identity(a), tree.identity(b));
+
+    CHECK(tree.arity_of(fused) == 2);
+    CHECK_FALSE(tree.is_empty(fused));
+    CHECK_FALSE(tree.is_empty(tree.intersect(fused, tree.make_term(relation_single_pair('a', 'a')))));
+    CHECK_FALSE(tree.is_empty(tree.intersect(fused, tree.make_term(relation_single_pair('b', 'b')))));
+    // Off-diagonal pair stays out.
+    CHECK(tree.is_empty(tree.intersect(fused, tree.make_term(relation_single_pair('a', 'b')))));
+}
+
+TEST_CASE("mata::nft::lazy – union of identities of empty languages is empty") {
+    SymbolicFormula tree;
+    const Term e1 = tree.make_term(empty_nfa());
+    const Term e2 = tree.make_term(empty_nfa());
+    CHECK(tree.is_empty(tree.unite(tree.identity(e1), tree.identity(e2))));
+}
+
+TEST_CASE("mata::nft::lazy – self-intersect of identity collapses to a single identity") {
+    // identity(L) ∩ identity(L), the same exec id on both sides triggers both
+    // identity fusion and idempotence in one go.
+    SymbolicFormula tree;
+    const Term a = tree.make_term(single_symbol_nfa('a'));
+    const Term diag = tree.identity(a);
+    const Term self_fused = tree.intersect(diag, diag);
+
+    CHECK(tree.arity_of(self_fused) == 2);
+    CHECK_FALSE(tree.is_empty(self_fused));
+    CHECK_FALSE(tree.is_empty(tree.intersect(self_fused, tree.make_term(relation_single_pair('a', 'a')))));
+    CHECK(tree.is_empty(tree.intersect(self_fused, tree.make_term(relation_single_pair('a', 'b')))));
+}
+
+TEST_CASE("mata::nft::lazy – complement of a self-union agrees with complement of one operand") {
+    SymbolicFormula tree;
+    const Term a = tree.make_term(single_symbol_nfa('a'));
+    const Term lhs = tree.complement(tree.unite(a, a));
+    const Term rhs = tree.complement(a);
+
+    CHECK(tree.is_empty(lhs) == tree.is_empty(rhs));
+}
+
+TEST_CASE("mata::nft::lazy – projecting identity by the full identity permutation stays correct") {
+    SymbolicFormula tree;
+    const Term a = tree.make_term(single_symbol_nfa('a'));
+    const Term diag = tree.identity(a);
+    // project(identity(a), [0, 1]) reduces back to identity(a) and stays a diagonal relation.
+    const Term rebuilt = tree.project(diag, {0, 1});
+
+    CHECK(tree.arity_of(rebuilt) == 2);
+    CHECK_FALSE(tree.is_empty(rebuilt));
+}
+
+// ---------------------------------------------------------------------------
+// 12. DiagonalSlice rewrite, project(intersect(identity(U), X), [0|1])
+//
+// These tests exercise both the recognized fast path (concrete-only leaves)
+// and the fallback path (where the recognizer declines to fire because the
+// leaves use special symbols), through the public API only.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+[[nodiscard]] Nft pair_a_a_and_b_b() {
+    // Diagonal of {a, b}, accepts (a, a) and (b, b) only.
+    Nft nft = Nft::with_levels(2, 5, {0}, {2, 4});
+    nft.levels[0] = 0;
+    nft.levels[1] = 1;
+    nft.levels[2] = 0;
+    nft.levels[3] = 1;
+    nft.levels[4] = 0;
+    nft.delta.add(0, 'a', 1);
+    nft.delta.add(1, 'a', 2);
+    nft.delta.add(0, 'b', 3);
+    nft.delta.add(3, 'b', 4);
+    return nft;
+}
+
+} // namespace
+
+TEST_CASE("mata::nft::lazy – diagonal slice via project of intersect of identity yields the diagonal language") {
+    SymbolicFormula tree;
+    const Term universe = tree.make_term(universal_nfa('a'));
+    const Term diag_rel = tree.make_term(pair_a_a_and_b_b());
+    const Term slice = tree.project(tree.intersect(tree.identity(universe), diag_rel), {0});
+
+    CHECK(tree.arity_of(slice) == 1);
+    CHECK_FALSE(tree.is_empty(slice));
+    // The slice should accept the symbol 'a' (universe contains it, diagonal contains (a, a)),
+    // intersecting with {a} stays non-empty.
+    CHECK_FALSE(tree.is_empty(tree.intersect(slice, tree.make_term(single_symbol_nfa('a')))));
+}
+
+TEST_CASE("mata::nft::lazy – diagonal slice with relation operand on the left of intersect") {
+    SymbolicFormula tree;
+    const Term universe = tree.make_term(universal_nfa('a'));
+    const Term diag_rel = tree.make_term(pair_a_a_and_b_b());
+    const Term slice = tree.project(tree.intersect(diag_rel, tree.identity(universe)), {0});
+
+    CHECK(tree.arity_of(slice) == 1);
+    CHECK_FALSE(tree.is_empty(slice));
+}
+
+TEST_CASE("mata::nft::lazy – diagonal slice projecting tape 1 gives the same language") {
+    SymbolicFormula tree;
+    const Term universe = tree.make_term(universal_nfa('a'));
+    const Term diag_rel = tree.make_term(pair_a_a_and_b_b());
+    const Term slice_0 = tree.project(tree.intersect(tree.identity(universe), diag_rel), {0});
+    const Term slice_1 = tree.project(tree.intersect(tree.identity(universe), diag_rel), {1});
+
+    CHECK(tree.is_empty(slice_0) == tree.is_empty(slice_1));
+    CHECK_FALSE(tree.is_empty(slice_1));
+}
+
+TEST_CASE("mata::nft::lazy – diagonal slice with empty language is empty") {
+    SymbolicFormula tree;
+    const Term empty = tree.make_term(empty_nfa());
+    const Term diag_rel = tree.make_term(pair_a_a_and_b_b());
+    const Term slice = tree.project(tree.intersect(tree.identity(empty), diag_rel), {0});
+    CHECK(tree.is_empty(slice));
+}
+
+TEST_CASE("mata::nft::lazy – diagonal slice with off-diagonal-only relation is empty") {
+    // relation_single_pair('a', 'b') has no diagonal entry.
+    SymbolicFormula tree;
+    const Term universe = tree.make_term(universal_nfa('a'));
+    const Term off_diag = tree.make_term(relation_single_pair('a', 'b'));
+    const Term slice = tree.project(tree.intersect(tree.identity(universe), off_diag), {0});
+    CHECK(tree.is_empty(slice));
+}
+
+TEST_CASE("mata::nft::lazy – diagonal slice with disjoint language and diagonal is empty") {
+    // Universe = {c}*, diagonal relation only contains (a, a) and (b, b), no overlap.
+    SymbolicFormula tree;
+    const Term universe = tree.make_term(universal_nfa('c'));
+    const Term diag_rel = tree.make_term(pair_a_a_and_b_b());
+    const Term slice = tree.project(tree.intersect(tree.identity(universe), diag_rel), {0});
+    CHECK(tree.is_empty(slice));
+}
+
+TEST_CASE("mata::nft::lazy – diagonal pattern with DONT_CARE relation falls back and stays correct") {
+    // The relation has DONT_CARE on tape 0 so the recognizer must not fire,
+    // the engine then evaluates via the generic intersect/project path.
+    SymbolicFormula tree;
+    const Term universe = tree.make_term(universal_nfa('a'));
+    const Term wildcard_rel = tree.make_term(relation_single_pair(DONT_CARE, 'a'));
+    const Term slice = tree.project(tree.intersect(tree.identity(universe), wildcard_rel), {0});
+
+    // Semantically, (DONT_CARE, 'a') matches any first-tape symbol with 'a' second.
+    // Diagonal {(w, w)} ∩ this allows only w = 'a'. Universe a* contains 'a', so non-empty.
+    CHECK_FALSE(tree.is_empty(slice));
+}
+
+TEST_CASE("mata::nft::lazy – diagonal pattern under complement still respects subsumption") {
+    SymbolicFormula tree;
+    const Term universe = tree.make_term(universal_nfa('a'));
+    const Term diag_rel = tree.make_term(pair_a_a_and_b_b());
+    const Term slice = tree.project(tree.intersect(tree.identity(universe), diag_rel), {0});
+
+    // The slice canonical alphabet contains both 'a' and 'b' because the diagonal relation
+    // mentions both, but the slice itself only accepts the single word "a". Its complement is
+    // non-empty (it contains ε, "b", "aa", and so on).
+    CHECK_FALSE(tree.is_empty(tree.complement(slice)));
+    // Intersecting the complement with the slice itself should be empty.
+    CHECK(tree.is_empty(tree.intersect(tree.complement(slice), slice)));
+}

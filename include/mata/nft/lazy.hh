@@ -49,6 +49,10 @@ public:
 };
 
 /// Kind of symbolic operator represented by a tree node.
+///
+/// `DiagonalSlice` is reconstruction-only, the public API never produces it directly,
+/// it is materialised by the reconstruction pass when it recognises the pattern
+/// `project(intersect(identity(U), X), [0|1])` (or its symmetric variants).
 enum class NodeKind : uint8_t {
     LeafNfa,
     LeafNft,
@@ -58,6 +62,7 @@ enum class NodeKind : uint8_t {
     Identity,
     Project,
     SyncProduct,
+    DiagonalSlice,
 };
 
 /// Reference one level of one side of a synchronized product.

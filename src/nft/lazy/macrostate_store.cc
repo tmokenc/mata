@@ -85,6 +85,7 @@ MacroStateStore::MacroStateStore(
                 break;
             case NodeKind::Intersect:
             case NodeKind::SyncProduct:
+            case NodeKind::DiagonalSlice:
                 pair_node_count += 1;
                 break;
             case NodeKind::Complement:
@@ -124,7 +125,8 @@ MacroStateStore::MacroStateStore(
                 break;
 
             case NodeKind::Intersect:
-            case NodeKind::SyncProduct: {
+            case NodeKind::SyncProduct:
+            case NodeKind::DiagonalSlice: {
                 const std::optional<size_t> lhs_bound = dense_macrostate_bounds[nodes[i].lhs];
                 const std::optional<size_t> rhs_bound = dense_macrostate_bounds[nodes[i].rhs];
                 node_to_store_index[i] = pair_stores.size();

@@ -447,6 +447,70 @@ const GeneratedTransition* SyncProductTransitionIterator::next() {
 }
 
 // ---------------------------------------------------------------------------
+// DiagonalSlice transition iterator implementation
+// ---------------------------------------------------------------------------
+
+void DiagonalSliceTransitionIterator::buffer_u_transitions() {
+    if (u_buffered) {
+        return;
+    }
+    u_buffered = true;
+    while (const GeneratedTransition* u_t = u_iter->next()) {
+        // U is arity 1 by recognition invariant.
+        u_by_symbol[u_t->tuple[0]].push_back(u_t->state);
+    }
+}
+
+bool DiagonalSliceTransitionIterator::advance_to_next_diagonal_x() {
+    // The recognizer only fires DiagonalSlice when both leaves are special-symbol free, so a
+    // direct symbol equality check is safe. DONT_CARE and EPSILON cases would need the merge
+    // logic in TransitionTupleHelper, which the iterator deliberately avoids.
+    while (const GeneratedTransition* x_t = x_iter->next()) {
+        if (x_t->tuple.size() != 2 || x_t->tuple[0] != x_t->tuple[1]) {
+            continue;
+        }
+        const auto u_it = u_by_symbol.find(x_t->tuple[0]);
+        if (u_it == u_by_symbol.end() || u_it->second.empty()) {
+            continue;
+        }
+        // Snapshot the X side, the live pointer may be invalidated by later iterator activity.
+        current_x_state = x_t->state;
+        current_diagonal_symbol = x_t->tuple[0];
+        u_match_index = 0;
+        x_loaded = true;
+        return true;
+    }
+    return false;
+}
+
+const GeneratedTransition* DiagonalSliceTransitionIterator::next() {
+    if (finished) {
+        return nullptr;
+    }
+    buffer_u_transitions();
+
+    while (true) {
+        if (x_loaded) {
+            const auto& u_matches = u_by_symbol[current_diagonal_symbol];
+            if (u_match_index < u_matches.size()) {
+                const GeneratedMacroState& u_match = u_matches[u_match_index++];
+                current = GeneratedTransition{
+                        SymbolTuple{current_diagonal_symbol},
+                        GeneratedMacroState{
+                                this->ctx.macro_store().intern(parent_id, PairState{u_match.id, current_x_state.id}),
+                                u_match.accepting && current_x_state.accepting}};
+                return &current;
+            }
+            x_loaded = false;
+        }
+        if (!advance_to_next_diagonal_x()) {
+            finished = true;
+            return nullptr;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Complement transition iterator implementation
 // ---------------------------------------------------------------------------
 

@@ -146,6 +146,12 @@ namespace {
                      node.payload < tree.sync_plans.size() &&
                      validate_sync_plan(tree, node, tree.sync_plans[node.payload]);
                 break;
+
+            case NodeKind::DiagonalSlice:
+                // Reconstruction-only node, the public API never produces it, so a user-built
+                // formula that contains it is malformed.
+                ok = false;
+                break;
         }
 
         marks[node_id] = ok ? VisitState::Done : VisitState::Unseen;

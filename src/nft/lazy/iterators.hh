@@ -464,6 +464,47 @@ struct SyncProductTransitionIterator final : TransitionIterator {
 };
 
 // ---------------------------------------------------------------------------
+// DiagonalSlice transition iterator
+//
+// Captures the pattern Diag(U, X) = { w : w ∈ U ∧ (w, w) ∈ X } where U is an
+// arity-1 language node and X is an arity-2 relation node. The macrostate is
+// PairState{u_state, x_state}, the same shape the equivalent
+// project(intersect(identity(U), X), [0|1]) tree would have produced, but the
+// iterator avoids the generic Identity, Intersect, and Project plumbing.
+// ---------------------------------------------------------------------------
+
+struct DiagonalSliceTransitionIterator final : TransitionIterator {
+    const NodeId parent_id;
+    TransitionIteratorPtr u_iter;
+    TransitionIteratorPtr x_iter;
+    /// Buffered transitions of the U side, indexed by symbol for diagonal lookup.
+    std::unordered_map<mata::Symbol, std::vector<GeneratedMacroState>> u_by_symbol{};
+    /// Snapshot of the current X transition's payload, copied out of the live iterator so the
+    /// pointer it returned does not have to outlive the next call to x_iter.
+    GeneratedMacroState current_x_state{};
+    mata::Symbol current_diagonal_symbol{0};
+    size_t u_match_index{0};
+    bool u_buffered{false};
+    bool x_loaded{false};
+    bool finished{false};
+
+    DiagonalSliceTransitionIterator(
+            IteratorContext& context, const NodeId node_id, const NodeId u_node_id, const MacroStateId u_state,
+            const NodeId x_node_id, const MacroStateId x_state)
+        : TransitionIterator{context}, parent_id{node_id},
+          u_iter{this->ctx.make_transition_iterator(u_node_id, u_state)},
+          x_iter{this->ctx.make_transition_iterator(x_node_id, x_state)} {}
+
+    GeneratedTransition current{};
+
+    const GeneratedTransition* next() override;
+
+private:
+    void buffer_u_transitions();
+    bool advance_to_next_diagonal_x();
+};
+
+// ---------------------------------------------------------------------------
 // Complement transition iterator
 // ---------------------------------------------------------------------------
 

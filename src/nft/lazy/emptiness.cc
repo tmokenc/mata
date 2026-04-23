@@ -29,6 +29,7 @@ namespace {
             case NodeKind::Intersect:
             case NodeKind::SyncProduct:
             case NodeKind::Complement:
+            case NodeKind::DiagonalSlice:
                 return true;
 
             case NodeKind::LeafNfa:
@@ -251,6 +252,12 @@ namespace {
                                 return GeneratedTransition{std::move(projected), t.state};
                             });
                 }
+
+                case NodeKind::DiagonalSlice: {
+                    const PairState pair = macro_store_.get_pair(node_id, state);
+                    return std::make_unique<DiagonalSliceTransitionIterator>(
+                            *this, node_id, node.lhs, pair.lhs, node.rhs, pair.rhs);
+                }
             }
 
             unreachable_kind(node.kind, "transition iterator");
@@ -274,6 +281,7 @@ namespace {
 
                 case NodeKind::Intersect:
                 case NodeKind::SyncProduct:
+                case NodeKind::DiagonalSlice:
                     return std::make_unique<ProductInitialStateIterator>(
                             *this, node_id, node.rhs, make_initial_state_iterator(node.lhs));
 

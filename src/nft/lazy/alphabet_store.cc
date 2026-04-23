@@ -67,6 +67,7 @@ namespace {
             case NodeKind::Union:
             case NodeKind::Intersect:
             case NodeKind::SyncProduct:
+            case NodeKind::DiagonalSlice:
                 collect_local_level_alphabets(nodes, node.lhs, nfas, nfts, level_alphabets, visited);
                 collect_local_level_alphabets(nodes, node.rhs, nfas, nfts, level_alphabets, visited);
                 break;
@@ -192,6 +193,15 @@ namespace {
                     }
                     break;
                 }
+
+                case NodeKind::DiagonalSlice:
+                    // Result is arity 1, both rhs tapes are forced equal (diagonal), and the lhs
+                    // language must agree with that shared symbol. So all four positions live in
+                    // one equivalence class, the result level, lhs[0], rhs[0], and rhs[1].
+                    unite(level_index(node_id, 0), level_index(node.lhs, 0));
+                    unite(level_index(node_id, 0), level_index(node.rhs, 0));
+                    unite(level_index(node_id, 0), level_index(node.rhs, 1));
+                    break;
             }
         }
 
@@ -288,6 +298,27 @@ namespace {
                     for (uint8_t level = 0; level < node.result_arity; ++level) {
                         effective[node_id][level] = effective[node.lhs][plan.kept_levels[level]];
                     }
+                    break;
+                }
+
+                case NodeKind::DiagonalSlice: {
+                    // Effective alphabet is the intersection of the language's level 0 and the
+                    // diagonal symbols of the relation, which means symbols that appear on both
+                    // tapes of the relation. Approximated as the intersection of all three.
+                    const auto& u_syms = effective[node.lhs][0];
+                    const auto& x_syms_0 = effective[node.rhs][0];
+                    const auto& x_syms_1 = effective[node.rhs][1];
+
+                    std::vector<mata::Symbol> x_diag;
+                    x_diag.reserve(std::min(x_syms_0.size(), x_syms_1.size()));
+                    std::set_intersection(
+                            x_syms_0.begin(), x_syms_0.end(), x_syms_1.begin(), x_syms_1.end(),
+                            std::back_inserter(x_diag));
+
+                    std::vector<mata::Symbol>& result = effective[node_id][0];
+                    result.reserve(std::min(u_syms.size(), x_diag.size()));
+                    std::set_intersection(
+                            u_syms.begin(), u_syms.end(), x_diag.begin(), x_diag.end(), std::back_inserter(result));
                     break;
                 }
             }

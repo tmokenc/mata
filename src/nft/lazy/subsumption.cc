@@ -187,6 +187,7 @@ void SubsumptionEngine::initialize_leaf_simulations_impl(const NodeId node_id, s
         case NodeKind::Union:
         case NodeKind::Intersect:
         case NodeKind::SyncProduct:
+        case NodeKind::DiagonalSlice:
             initialize_leaf_simulations_impl(node.lhs, visited);
             initialize_leaf_simulations_impl(node.rhs, visited);
             break;
@@ -239,7 +240,8 @@ bool SubsumptionEngine::subsumed_state(const NodeId node_id, const MacroStateId 
         }
 
         case NodeKind::Intersect:
-        case NodeKind::SyncProduct: {
+        case NodeKind::SyncProduct:
+        case NodeKind::DiagonalSlice: {
             if (const std::optional<bool> cached_result = caches[node_id].get(state1, state2)) {
                 return *cached_result;
             }
