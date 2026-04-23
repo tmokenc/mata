@@ -60,7 +60,7 @@ nfa_ops::Nfa words_starting_with_a_and_ending_with_b() {
 } // namespace
 
 int main() {
-    nfa_lazy::SymbolicAutomataTree tree;
+    nfa_lazy::SymbolicFormula tree;
 
     const nfa_lazy::Term l_a = tree.make_term(words_starting_with_a());
     const nfa_lazy::Term l_b = tree.make_term(words_ending_with_b());

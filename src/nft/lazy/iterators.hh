@@ -8,14 +8,17 @@
 #include "alphabet_store.hh"
 #include "subsumption.hh"
 
+#include <algorithm>
+#include <cassert>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace mata::nft::lazy::detail {
 
 /// Visible label tuple used by the lazy transition iterators.
-using SymbolTuple = std::vector<mata::Symbol>;
+using SymbolTuple = SmallVec2<mata::Symbol>;
 
 /// One generated successor macrostate paired with its acceptance flag.
 struct GeneratedMacroState {
@@ -37,11 +40,11 @@ using TransitionIteratorPtr = std::unique_ptr<TransitionIterator>;
  * @brief Internal sync-plan form with precomputed per-level peer lookup.
  */
 struct CompiledSyncPlan {
-    std::vector<uint8_t> lhs_sync_levels{};
-    std::vector<uint8_t> rhs_sync_levels{};
-    std::vector<LevelRef> result_layout{};
-    std::vector<int16_t> lhs_sync_peer_by_level{};
-    std::vector<int16_t> rhs_sync_peer_by_level{};
+    SmallVec2<uint8_t> lhs_sync_levels{};
+    SmallVec2<uint8_t> rhs_sync_levels{};
+    SmallVec2<LevelRef> result_layout{};
+    SmallVec2<int16_t> lhs_sync_peer_by_level{};
+    SmallVec2<int16_t> rhs_sync_peer_by_level{};
 };
 
 /**
@@ -58,41 +61,33 @@ struct ResolvedSpecialSymbols {
     uint8_t flags{0};
 };
 
+/// One symbol observed at a specific level of a specific exec node.
+struct SymbolRef {
+    NodeId node;
+    uint8_t level;
+    mata::Symbol symbol;
+};
+
 /**
  * @brief Shared tuple-compatibility helper used by transition iterators.
  */
 class TransitionTupleHelper {
 public:
-    /**
-     * @brief Construct the helper over one reconstructed exec DAG.
-     * @param nodes Reconstructed exec nodes.
-     * @param alphabets Resolved visible alphabets for the exec DAG.
-     */
     TransitionTupleHelper(const std::vector<ExecNode>& nodes, const AlphabetStore& alphabets);
 
-    /**
-     * @brief Merge two visible tuples according to wildcard and epsilon semantics.
-     * @param lhs_node_id Reconstructed left-hand exec node id.
-     * @param lhs_tuple Left visible tuple.
-     * @param rhs_node_id Reconstructed right-hand exec node id.
-     * @param rhs_tuple Right visible tuple.
-     * @param merged_tuple Output parameter receiving the merged tuple on success.
-     * @return `true` if the tuples are compatible, `false` otherwise.
-     */
     bool merge_visible_tuples(
             NodeId lhs_node_id, const SymbolTuple& lhs_tuple, NodeId rhs_node_id, const SymbolTuple& rhs_tuple,
             SymbolTuple& merged_tuple);
 
     /**
-     * @brief Build one visible sync-product tuple when the synchronized levels are compatible.
-     * @param lhs_node_id Reconstructed left-hand exec node id.
-     * @param lhs_tuple Left visible tuple.
-     * @param rhs_node_id Reconstructed right-hand exec node id.
-     * @param rhs_tuple Right visible tuple.
-     * @param plan Compiled sync-product layout.
-     * @param result_tuple Output parameter receiving the result tuple on success.
-     * @return `true` if the synchronized levels are compatible, `false` otherwise.
+     * @brief Return true if each symbol of @p lhs_tuple can possibly match a transition of @p rhs_id.
+     *
+     * A symbol cannot match when it is not DONT_CARE, it is absent from rhs's effective alphabet,
+     * and rhs has no DONT_CARE transitions at that level.  Used to skip lhs transitions early in
+     * IntersectTransitionIterator without replaying the full rhs buffer.
      */
+    bool lhs_compatible_with_rhs(NodeId lhs_id, const SymbolTuple& lhs_tuple, NodeId rhs_id);
+
     bool build_visible_sync_result(
             NodeId lhs_node_id, const SymbolTuple& lhs_tuple, NodeId rhs_node_id, const SymbolTuple& rhs_tuple,
             const CompiledSyncPlan& plan, SymbolTuple& result_tuple);
@@ -100,104 +95,28 @@ public:
 private:
     const std::vector<ExecNode>& nodes;
     const AlphabetStore& alphabets;
-    std::vector<std::vector<ResolvedSpecialSymbols>> special_symbols_by_level;
+    std::vector<SmallVec2<ResolvedSpecialSymbols>> special_symbols_by_level;
 
-    /**
-     * @brief Populate the cached resolved special symbols for all node levels.
-     */
     void initialize_special_symbol_cache();
 
-    /**
-     * @brief Resolve one special symbol inside the visible alphabet of a node level.
-     * @param node_id Reconstructed exec node id.
-     * @param level Visible level within the node.
-     * @param special_symbol Logical special symbol to resolve.
-     * @return Resolved symbol value, or `std::nullopt` when absent.
-     */
     std::optional<mata::Symbol>
     resolve_special_symbol_id(NodeId node_id, uint8_t level, mata::Symbol special_symbol) const;
 
-    /**
-     * @brief Check whether a resolved symbol is the visible epsilon on one node level.
-     * @param node_id Reconstructed exec node id.
-     * @param level Visible level within the node.
-     * @param resolved_symbol Resolved visible symbol to test.
-     * @return `true` if the symbol is epsilon on the given level, `false` otherwise.
-     */
-    bool is_resolved_epsilon(NodeId node_id, uint8_t level, mata::Symbol resolved_symbol) const;
+    bool is_resolved_epsilon(SymbolRef ref) const;
+    bool is_resolved_dont_care(SymbolRef ref) const;
 
-    /**
-     * @brief Check whether a resolved symbol is the visible dont-care on one node level.
-     * @param node_id Reconstructed exec node id.
-     * @param level Visible level within the node.
-     * @param resolved_symbol Resolved visible symbol to test.
-     * @return `true` if the symbol is dont-care on the given level, `false` otherwise.
-     */
-    bool is_resolved_dont_care(NodeId node_id, uint8_t level, mata::Symbol resolved_symbol) const;
+    bool is_resolved_special_symbol(SymbolRef ref, mata::Symbol special_symbol) const;
 
-    /**
-     * @brief Check whether a resolved symbol matches one logical special symbol on a node level.
-     * @param node_id Reconstructed exec node id.
-     * @param level Visible level within the node.
-     * @param resolved_symbol Resolved visible symbol to test.
-     * @param special_symbol Logical special symbol being queried.
-     * @return `true` if the symbol matches, `false` otherwise.
-     */
-    bool is_resolved_special_symbol(
-            NodeId node_id, uint8_t level, mata::Symbol resolved_symbol, mata::Symbol special_symbol) const;
+    bool try_merge_symbols(SymbolRef lhs, SymbolRef rhs, mata::Symbol& merged_symbol) const;
 
-    /**
-     * @brief Merge two visible symbols under epsilon and dont-care semantics.
-     * @param lhs_node_id Reconstructed left-hand exec node id.
-     * @param lhs_level Visible level of the left symbol.
-     * @param lhs_symbol Left resolved symbol.
-     * @param rhs_node_id Reconstructed right-hand exec node id.
-     * @param rhs_level Visible level of the right symbol.
-     * @param rhs_symbol Right resolved symbol.
-     * @param merged_symbol Output parameter receiving the merged symbol on success.
-     * @return `true` if the symbols are compatible, `false` otherwise.
-     */
-    bool try_merge_symbols(
-            NodeId lhs_node_id, uint8_t lhs_level, mata::Symbol lhs_symbol, NodeId rhs_node_id, uint8_t rhs_level,
-            mata::Symbol rhs_symbol, mata::Symbol& merged_symbol) const;
-
-    /**
-     * @brief Merge two full visible tuples under epsilon and dont-care semantics.
-     * @param lhs_node_id Reconstructed left-hand exec node id.
-     * @param lhs_tuple Left visible tuple.
-     * @param rhs_node_id Reconstructed right-hand exec node id.
-     * @param rhs_tuple Right visible tuple.
-     * @param merged_tuple Output parameter receiving the merged tuple on success.
-     * @return `true` if the tuples are compatible, `false` otherwise.
-     */
     bool try_merge_tuples(
             NodeId lhs_node_id, const SymbolTuple& lhs_tuple, NodeId rhs_node_id, const SymbolTuple& rhs_tuple,
             SymbolTuple& merged_tuple) const;
 
-    /**
-     * @brief Check compatibility of the synchronized levels of two visible tuples.
-     * @param lhs_node_id Reconstructed left-hand exec node id.
-     * @param lhs_tuple Left visible tuple.
-     * @param lhs_levels Synchronized levels selected from the left tuple.
-     * @param rhs_node_id Reconstructed right-hand exec node id.
-     * @param rhs_tuple Right visible tuple.
-     * @param rhs_levels Synchronized levels selected from the right tuple.
-     * @return `true` if all synchronized levels are compatible, `false` otherwise.
-     */
     bool sync_levels_match(
-            NodeId lhs_node_id, const SymbolTuple& lhs_tuple, const std::vector<uint8_t>& lhs_levels,
-            NodeId rhs_node_id, const SymbolTuple& rhs_tuple, const std::vector<uint8_t>& rhs_levels) const;
+            NodeId lhs_node_id, const SymbolTuple& lhs_tuple, const SmallVec2<uint8_t>& lhs_levels, NodeId rhs_node_id,
+            const SymbolTuple& rhs_tuple, const SmallVec2<uint8_t>& rhs_levels) const;
 
-    /**
-     * @brief Build the output tuple of one successful sync-product combination.
-     * @param lhs_node_id Reconstructed left-hand exec node id.
-     * @param lhs_tuple Left visible tuple.
-     * @param rhs_node_id Reconstructed right-hand exec node id.
-     * @param rhs_tuple Right visible tuple.
-     * @param plan Compiled sync-product layout.
-     * @param result_tuple Output parameter receiving the result tuple on success.
-     * @return `true` if the tuple can be built, `false` otherwise.
-     */
     bool build_sync_result_tuple(
             NodeId lhs_node_id, const SymbolTuple& lhs_tuple, NodeId rhs_node_id, const SymbolTuple& rhs_tuple,
             const CompiledSyncPlan& plan, SymbolTuple& result_tuple) const;
@@ -207,14 +126,10 @@ private:
  * @brief Iterator-facing services provided by the lazy emptiness context.
  */
 struct IteratorContext {
-    /// Virtual destructor for polymorphic use.
     virtual ~IteratorContext() = default;
 
-    /// Access the macrostate store used for interning generated states.
-    virtual MacroStateStore& macro_store_ref() = 0;
-    /// Build an iterator over outgoing visible transitions of one node/state pair.
+    virtual MacroStateStore& macro_store() = 0;
     virtual TransitionIteratorPtr make_transition_iterator(NodeId node_id, MacroStateId state) = 0;
-    /// Build an iterator over initial macrostates of @p node_id.
     virtual InitialStateIteratorPtr make_initial_state_iterator(NodeId node_id) = 0;
 };
 
@@ -224,12 +139,9 @@ struct IteratorContext {
 struct InitialStateIterator {
     IteratorContext& ctx;
 
-    /// Bind the iterator to the owning context.
     explicit InitialStateIterator(IteratorContext& context) : ctx{context} {}
-    /// Virtual destructor for polymorphic use.
     virtual ~InitialStateIterator() = default;
-    /// Return the next generated initial macrostate, or `std::nullopt` when exhausted.
-    virtual std::optional<GeneratedMacroState> next() = 0;
+    virtual const GeneratedMacroState* next() = 0;
 };
 
 /**
@@ -246,78 +158,347 @@ struct GeneratedTransition {
 struct TransitionIterator {
     IteratorContext& ctx;
 
-    /// Bind the iterator to the owning context.
     explicit TransitionIterator(IteratorContext& context) : ctx{context} {}
-    /// Virtual destructor for polymorphic use.
     virtual ~TransitionIterator() = default;
-    /// Return the next generated transition, or `std::nullopt` when exhausted.
-    virtual std::optional<GeneratedTransition> next() = 0;
+    virtual const GeneratedTransition* next() = 0;
 };
 
-/// Build an iterator over initial states of an NFA leaf.
-InitialStateIteratorPtr make_leaf_nfa_initial_state_iterator(IteratorContext& context, const mata::nfa::Nfa& automaton);
+// ---------------------------------------------------------------------------
+// Replay helpers
+// ---------------------------------------------------------------------------
 
-/// Build an iterator over initial states of an NFT leaf.
-InitialStateIteratorPtr make_leaf_nft_initial_state_iterator(IteratorContext& context, const mata::nft::Nft& automaton);
+template<typename Item, typename IteratorPtr>
+class ReplayBuffer {
+public:
+    ReplayBuffer() = default;
+    explicit ReplayBuffer(IteratorPtr iterator) : live_iterator{std::move(iterator)}, replayed_items{} {}
 
-/// Build an iterator over initial states of a union node.
-InitialStateIteratorPtr make_union_initial_state_iterator(
-        IteratorContext& context, NodeId node_id, InitialStateIteratorPtr lhs_initial_iter,
-        InitialStateIteratorPtr rhs_initial_iter);
+    const Item* next() {
+        if (replay_index < replayed_items.size()) {
+            return &replayed_items[replay_index++];
+        }
 
-/// Build an iterator over initial states of a binary product-style node.
-InitialStateIteratorPtr make_product_initial_state_iterator(
-        IteratorContext& context, NodeId node_id, NodeId rhs_id, InitialStateIteratorPtr lhs_initial_iter);
+        if (replay_complete || live_iterator == nullptr) {
+            return nullptr;
+        }
 
-/// Build an iterator over initial states of a complement node.
-InitialStateIteratorPtr make_complement_initial_state_iterator(
-        IteratorContext& context, NodeId node_id, NodeId child_id, InitialStateIteratorPtr child_initial_iter,
-        SubsumptionEngine& subsumption);
+        const Item* item = live_iterator->next();
+        if (!item) {
+            live_iterator.reset();
+            replay_complete = true;
+            return nullptr;
+        }
 
-/// Build an iterator that forwards child initial states unchanged.
-InitialStateIteratorPtr
-make_passthrough_initial_state_iterator(IteratorContext& context, InitialStateIteratorPtr child_initial_iter);
+        replayed_items.push_back(*item);
+        replay_index = replayed_items.size();
+        return &replayed_items.back();
+    }
 
-/// Build an iterator over visible transitions of an NFA leaf.
-TransitionIteratorPtr make_leaf_nfa_transition_iterator(
-        IteratorContext& context, const mata::nfa::Nfa& automaton, const AlphabetStore& alphabet_store, NodeId node_id,
-        MacroStateId state);
+    void rewind() { replay_index = 0; }
 
-/// Build an iterator over visible transitions of an NFT leaf.
-TransitionIteratorPtr make_leaf_nft_transition_iterator(
-        IteratorContext& context, const mata::nft::Nft& automaton, const AlphabetStore& alphabet_store, NodeId node_id,
-        MacroStateId state, size_t result_arity);
+private:
+    IteratorPtr live_iterator{};
+    std::vector<Item> replayed_items{};
+    size_t replay_index{0};
+    bool replay_complete{false};
+};
 
-/// Build an iterator that replays already materialized transitions from a cache entry.
+template<typename Item, typename IteratorPtr>
+class ReplayJoinCursor {
+public:
+    ReplayJoinCursor(IteratorPtr lhs_iterator, IteratorPtr rhs_iterator)
+        : lhs_iter{std::move(lhs_iterator)}, rhs_items{std::move(rhs_iterator)}, current_lhs{nullptr} {
+        advance_lhs();
+    }
+
+    ReplayJoinCursor(const ReplayJoinCursor&) = delete;
+    ReplayJoinCursor& operator=(const ReplayJoinCursor&) = delete;
+
+    const Item* lhs() const { return current_lhs; }
+    const Item* next_rhs() { return rhs_items.next(); }
+
+    bool advance_lhs() {
+        current_lhs = lhs_iter->next();
+        if (!current_lhs) {
+            return false;
+        }
+        rhs_items.rewind();
+        return true;
+    }
+
+private:
+    IteratorPtr lhs_iter;
+    ReplayBuffer<Item, IteratorPtr> rhs_items;
+    const Item* current_lhs;
+};
+
+// ---------------------------------------------------------------------------
+// Mapped transition iterator (used for Union, Identity, Project)
+// ---------------------------------------------------------------------------
+
+template<typename Mapper>
+class MappedTransitionIterator final : public TransitionIterator {
+public:
+    MappedTransitionIterator(IteratorContext& context, TransitionIteratorPtr child_transition_iter, Mapper mapper)
+        : TransitionIterator{context}, child_iter{std::move(child_transition_iter)}, map{std::move(mapper)} {}
+
+    const GeneratedTransition* next() override {
+        const GeneratedTransition* child_transition = child_iter->next();
+        if (!child_transition) {
+            return nullptr;
+        }
+        current = map(this->ctx, *child_transition);
+        return &current;
+    }
+
+private:
+    TransitionIteratorPtr child_iter;
+    Mapper map;
+    GeneratedTransition current{};
+};
+
+template<typename Mapper>
 TransitionIteratorPtr
-make_buffered_transition_iterator(IteratorContext& context, const std::vector<GeneratedTransition>& transitions);
+make_mapped_transition_iterator(IteratorContext& context, TransitionIteratorPtr child_transition_iter, Mapper mapper) {
+    return std::make_unique<MappedTransitionIterator<Mapper>>(
+            context, std::move(child_transition_iter), std::move(mapper));
+}
 
-/// Build an iterator that retags child transitions for a union node.
-TransitionIteratorPtr make_union_transition_iterator(
-        IteratorContext& context, NodeId node_id, TaggedState::Tag branch_tag,
-        TransitionIteratorPtr child_transition_iter);
+// ---------------------------------------------------------------------------
+// Initial-state iterator concrete types
+// ---------------------------------------------------------------------------
 
-/// Build an iterator that duplicates the single visible level of an identity node.
-TransitionIteratorPtr
-make_identity_transition_iterator(IteratorContext& context, TransitionIteratorPtr child_transition_iter);
+template<typename Automaton>
+struct LeafInitialStateIterator final : InitialStateIterator {
+    using InitialIterator = decltype(std::declval<const Automaton&>().initial.begin());
 
-/// Build an iterator that projects away removed levels from child transitions.
-TransitionIteratorPtr make_project_transition_iterator(
-        IteratorContext& context, const ProjectPlan& project_plan, TransitionIteratorPtr child_transition_iter);
+    const Automaton& automaton;
+    InitialIterator pos;
+    InitialIterator end;
+    GeneratedMacroState current{};
 
-/// Build an iterator over visible transitions of an intersection node.
-TransitionIteratorPtr make_intersect_transition_iterator(
-        IteratorContext& context, TransitionTupleHelper& tuple_helper, NodeId node_id, NodeId lhs_id,
-        MacroStateId lhs_state, NodeId rhs_id, MacroStateId rhs_state);
+    LeafInitialStateIterator(IteratorContext& context, const Automaton& source)
+        : InitialStateIterator{context}, automaton{source}, pos{automaton.initial.begin()},
+          end{automaton.initial.end()} {}
 
-/// Build an iterator over visible transitions of a sync-product node.
-TransitionIteratorPtr make_sync_product_transition_iterator(
-        IteratorContext& context, TransitionTupleHelper& tuple_helper, NodeId node_id, NodeId lhs_id,
-        MacroStateId lhs_state, NodeId rhs_id, MacroStateId rhs_state, const CompiledSyncPlan& compiled_plan);
+    const GeneratedMacroState* next() override {
+        if (pos == end) {
+            return nullptr;
+        }
+        const auto initial_state = *pos;
+        ++pos;
+        current =
+                GeneratedMacroState{static_cast<MacroStateId>(initial_state), automaton.final.contains(initial_state)};
+        return &current;
+    }
+};
 
-/// Build an iterator over visible transitions of a complement node.
-TransitionIteratorPtr make_complement_transition_iterator(
-        IteratorContext& context, NodeId node_id, NodeId child_id, const SetState& child_states,
-        SubsumptionEngine& subsumption, const std::vector<std::vector<mata::Symbol>>& symbols_per_level);
+struct UnionInitialStateIterator final : InitialStateIterator {
+    const NodeId parent_id;
+    InitialStateIteratorPtr lhs_iter;
+    InitialStateIteratorPtr rhs_iter;
+    GeneratedMacroState current{};
+
+    UnionInitialStateIterator(
+            IteratorContext& context, const NodeId node_id, InitialStateIteratorPtr lhs_initial_iter,
+            InitialStateIteratorPtr rhs_initial_iter)
+        : InitialStateIterator{context}, parent_id{node_id}, lhs_iter{std::move(lhs_initial_iter)},
+          rhs_iter{std::move(rhs_initial_iter)} {}
+
+    const GeneratedMacroState* next() override;
+};
+
+struct ProductInitialStateIterator final : InitialStateIterator {
+    const NodeId parent_id;
+    ReplayJoinCursor<GeneratedMacroState, InitialStateIteratorPtr> state_pairs;
+    GeneratedMacroState current{};
+
+    ProductInitialStateIterator(
+            IteratorContext& context, const NodeId node_id, const NodeId next_rhs_id,
+            InitialStateIteratorPtr lhs_initial_iter)
+        : InitialStateIterator{context}, parent_id{node_id},
+          state_pairs{std::move(lhs_initial_iter), this->ctx.make_initial_state_iterator(next_rhs_id)} {}
+
+    const GeneratedMacroState* next() override;
+};
+
+struct ComplementInitialStateIterator final : InitialStateIterator {
+    const NodeId parent_id;
+    const NodeId child_id;
+    InitialStateIteratorPtr child_iter;
+    SubsumptionEngine& subsumption;
+    bool emitted;
+
+    ComplementInitialStateIterator(
+            IteratorContext& context, const NodeId node_id, const NodeId next_child_id,
+            InitialStateIteratorPtr child_initial_iter, SubsumptionEngine& subsumption)
+        : InitialStateIterator{context}, parent_id{node_id}, child_id{next_child_id},
+          child_iter{std::move(child_initial_iter)}, subsumption{subsumption}, emitted{false} {}
+
+    GeneratedMacroState current{};
+
+    const GeneratedMacroState* next() override;
+};
+
+
+// ---------------------------------------------------------------------------
+// Transition iterator concrete types
+// ---------------------------------------------------------------------------
+
+struct LeafNfaTransitionIterator final : TransitionIterator {
+    using MoveIterator = mata::nfa::StatePost::Moves::const_iterator;
+
+    const mata::nfa::Nfa& nfa;
+    const AlphabetStore& alphabets;
+    const NodeId node_id;
+    mata::nfa::StatePost::Moves moves;
+    MoveIterator pos;
+    MoveIterator end;
+
+    LeafNfaTransitionIterator(
+            IteratorContext& context, const mata::nfa::Nfa& automaton, const AlphabetStore& alphabet_store,
+            const NodeId exec_node_id, const MacroStateId state)
+        : TransitionIterator{context}, nfa{automaton}, alphabets{alphabet_store}, node_id{exec_node_id},
+          moves{nfa.delta.state_post(static_cast<mata::nfa::State>(state)).moves()}, pos{moves.begin()},
+          end{mata::nfa::StatePost::Moves::end()} {}
+
+    GeneratedTransition current{};
+
+    const GeneratedTransition* next() override;
+};
+
+struct LeafNftTransitionIterator final : TransitionIterator {
+    using MoveIterator = mata::nfa::StatePost::Moves::const_iterator;
+
+    struct Frame {
+        mata::nfa::StatePost::Moves moves;
+        MoveIterator current;
+        MoveIterator end;
+
+        explicit Frame(const mata::nfa::StatePost& state_post)
+            : moves{state_post.moves()}, current{moves.begin()}, end{mata::nfa::StatePost::Moves::end()} {}
+    };
+
+    const mata::nft::Nft& nft;
+    const AlphabetStore& alphabets;
+    const NodeId node_id;
+    const size_t arity;
+    const mata::nfa::State source_state;
+    SmallVec2<Frame> frames;
+    SymbolTuple current_tuple;
+    bool initialized;
+    bool emitted_empty;
+
+    LeafNftTransitionIterator(
+            IteratorContext& context, const mata::nft::Nft& automaton, const AlphabetStore& alphabet_store,
+            const NodeId exec_node_id, const MacroStateId state, const size_t result_arity)
+        : TransitionIterator{context}, nft{automaton}, alphabets{alphabet_store}, node_id{exec_node_id},
+          arity{result_arity}, source_state{static_cast<mata::nfa::State>(state)}, frames{},
+          current_tuple(result_arity, 0), initialized{false}, emitted_empty{false} {}
+
+    GeneratedTransition current{};
+
+    const GeneratedTransition* next() override;
+
+private:
+    const GeneratedTransition* next_empty_transition();
+    void initialize_once();
+    bool skip_exhausted_frames();
+    const GeneratedTransition* try_emit_current_transition();
+    bool try_translate_symbol(size_t level, mata::Symbol local_symbol, mata::Symbol& resolved_symbol) const;
+    void push_frame(mata::nfa::State state);
+};
+
+struct BufferedTransitionIterator final : TransitionIterator {
+    const std::vector<GeneratedTransition>& transitions;
+    size_t index;
+
+    BufferedTransitionIterator(IteratorContext& context, const std::vector<GeneratedTransition>& buffered_transitions)
+        : TransitionIterator{context}, transitions{buffered_transitions}, index{0} {}
+
+    const GeneratedTransition* next() override;
+};
+
+struct IntersectTransitionIterator final : TransitionIterator {
+    TransitionTupleHelper& transition_tuple_helper;
+    const NodeId parent_id;
+    const NodeId lhs_id;
+    const NodeId rhs_id;
+    ReplayJoinCursor<GeneratedTransition, TransitionIteratorPtr> transition_pairs;
+
+    IntersectTransitionIterator(
+            IteratorContext& context, TransitionTupleHelper& tuple_helper, const NodeId node_id,
+            const NodeId next_lhs_id, const MacroStateId lhs_state, const NodeId next_rhs_id,
+            const MacroStateId next_rhs_state)
+        : TransitionIterator{context}, transition_tuple_helper{tuple_helper}, parent_id{node_id}, lhs_id{next_lhs_id},
+          rhs_id{next_rhs_id}, transition_pairs{
+                                       this->ctx.make_transition_iterator(lhs_id, lhs_state),
+                                       this->ctx.make_transition_iterator(next_rhs_id, next_rhs_state)} {}
+
+    GeneratedTransition current{};
+
+    const GeneratedTransition* next() override;
+};
+
+struct SyncProductTransitionIterator final : TransitionIterator {
+    TransitionTupleHelper& transition_tuple_helper;
+    const NodeId parent_id;
+    const NodeId lhs_id;
+    const NodeId rhs_id;
+    const CompiledSyncPlan& plan;
+    ReplayJoinCursor<GeneratedTransition, TransitionIteratorPtr> transition_pairs;
+
+    SyncProductTransitionIterator(
+            IteratorContext& context, TransitionTupleHelper& tuple_helper, const NodeId node_id,
+            const NodeId next_lhs_id, const MacroStateId lhs_state, const NodeId next_rhs_id,
+            const MacroStateId next_rhs_state, const CompiledSyncPlan& compiled_plan)
+        : TransitionIterator{context}, transition_tuple_helper{tuple_helper}, parent_id{node_id}, lhs_id{next_lhs_id},
+          rhs_id{next_rhs_id}, plan{compiled_plan},
+          transition_pairs{
+                  this->ctx.make_transition_iterator(lhs_id, lhs_state),
+                  this->ctx.make_transition_iterator(next_rhs_id, next_rhs_state)} {}
+
+    GeneratedTransition current{};
+
+    const GeneratedTransition* next() override;
+};
+
+// ---------------------------------------------------------------------------
+// Complement transition iterator
+// ---------------------------------------------------------------------------
+
+struct ComplementTransitionIterator final : TransitionIterator {
+    struct IndexedChildTransitions {
+        std::vector<GeneratedTransition> transitions;
+        size_t next_index{0};
+    };
+
+    const NodeId parent_id;
+    const NodeId child_id;
+    const SetState& sub_states;
+    SubsumptionEngine& subsumption;
+    const SmallVec2<std::vector<mata::Symbol>>& level_symbols;
+    std::vector<IndexedChildTransitions> indexed_child_transitions;
+    SmallVec2<size_t> indices;
+    SymbolTuple current_tuple;
+    SetState next_sub_states{};
+    bool use_monotonic_child_index;
+    bool finished;
+
+    ComplementTransitionIterator(
+            IteratorContext& context, NodeId node_id, NodeId next_child_id, const SetState& child_states,
+            SubsumptionEngine& subsumption, const SmallVec2<std::vector<mata::Symbol>>& symbols_per_level);
+
+    GeneratedTransition current{};
+
+    const GeneratedTransition* next() override;
+
+private:
+    void collect_matching_successors(const SymbolTuple& tuple, SetState& next_sub_states, bool& accepting);
+    void build_child_transition_index();
+    void collect_matching_successors_direct(const SymbolTuple& tuple, SetState& next_sub_states, bool& accepting);
+    void collect_matching_successors_indexed(const SymbolTuple& tuple, SetState& next_sub_states, bool& accepting);
+    void advance_tuple();
+};
 
 } // namespace mata::nft::lazy::detail

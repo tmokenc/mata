@@ -17,6 +17,9 @@ namespace mata::nft::lazy::detail {
 
 namespace {
 
+    // Merge every symbol from `alphabet` into `canonical_alphabet` by name, assigning a fresh
+    // canonical ID when the name is new.  This normalises symbols from different local alphabets
+    // (which can assign the same name to different integer values) into a single shared namespace.
     void add_symbols_to_canonical(const mata::OnTheFlyAlphabet& alphabet, mata::OnTheFlyAlphabet& canonical_alphabet) {
         for (const mata::Symbol symbol : alphabet.get_alphabet_symbols()) {
             canonical_alphabet.translate_symb(alphabet.reverse_translate_symbol(symbol));
@@ -25,7 +28,7 @@ namespace {
 
     void collect_local_level_alphabets(
             const std::vector<ExecNode>& nodes, const NodeId node_id, const std::vector<mata::nfa::Nfa>& nfas,
-            const std::vector<mata::nft::Nft>& nfts, std::vector<std::vector<mata::OnTheFlyAlphabet>>& level_alphabets,
+            const std::vector<mata::nft::Nft>& nfts, std::vector<SmallVec2<mata::OnTheFlyAlphabet>>& level_alphabets,
             std::vector<bool>& visited) {
         if (visited[node_id]) {
             return;
@@ -35,7 +38,7 @@ namespace {
         level_alphabets[node_id].resize(node.result_arity);
 
         switch (node.kind) {
-            case ExecKind::LeafNfa: {
+            case NodeKind::LeafNfa: {
                 const mata::nfa::Nfa& nfa = nfas[node.lhs];
                 mata::OnTheFlyAlphabet& alphabet = level_alphabets[node_id][0];
                 for (const auto& state_post : nfa.delta) {
@@ -46,41 +49,31 @@ namespace {
                 break;
             }
 
-            case ExecKind::LeafNft:
-            case ExecKind::Arity2LeafNft: {
+            case NodeKind::LeafNft: {
                 const mata::nft::Nft& nft = nfts[node.lhs];
-                std::vector<mata::OnTheFlyAlphabet>& node_level_alphabets = level_alphabets[node_id];
+                SmallVec2<mata::OnTheFlyAlphabet>& node_level_alphabets = level_alphabets[node_id];
                 for (mata::nfa::State state = 0; state < nft.delta.num_of_states(); ++state) {
                     const uint8_t level = static_cast<uint8_t>(nft.levels[state]);
                     assert(level < node_level_alphabets.size());
 
                     for (const auto& symbol_post : nft.delta.state_post(state)) {
                         node_level_alphabets[level].translate_symb(
-                                AlphabetStore::symbol_name_for(
-                                        const_cast<mata::Alphabet*>(nft.alphabet_of_level(level)), symbol_post.symbol));
+                                AlphabetStore::symbol_name_for(nft.alphabet_of_level(level), symbol_post.symbol));
                     }
                 }
                 break;
             }
 
-            case ExecKind::Union:
-            case ExecKind::Intersect:
-            case ExecKind::Arity1Union:
-            case ExecKind::Arity1Intersect:
-            case ExecKind::Arity2Union:
-            case ExecKind::Arity2Intersect:
-            case ExecKind::SyncProduct:
-            case ExecKind::Arity2SyncProduct:
+            case NodeKind::Union:
+            case NodeKind::Intersect:
+            case NodeKind::SyncProduct:
                 collect_local_level_alphabets(nodes, node.lhs, nfas, nfts, level_alphabets, visited);
                 collect_local_level_alphabets(nodes, node.rhs, nfas, nfts, level_alphabets, visited);
                 break;
 
-            case ExecKind::Complement:
-            case ExecKind::Identity:
-            case ExecKind::Project:
-            case ExecKind::Arity1Complement:
-            case ExecKind::Arity2Complement:
-            case ExecKind::Arity2Project:
+            case NodeKind::Complement:
+            case NodeKind::Identity:
+            case NodeKind::Project:
                 collect_local_level_alphabets(nodes, node.lhs, nfas, nfts, level_alphabets, visited);
                 break;
         }
@@ -88,11 +81,19 @@ namespace {
         visited[node_id] = true;
     }
 
+    // Merge related (node, level) pairs into equivalence classes using union-find, then assign each
+    // class a single canonical OnTheFlyAlphabet containing all symbols from every member.
+    //
+    // Two levels are "related" when they represent the same tape position: e.g. both children of an
+    // Intersect node share the same level with their parent, so their alphabets are merged.  After
+    // this function every node's level_alphabets[node][level] points to the canonical alphabet of
+    // its equivalence class.
     void canonicalize_level_alphabets(
             const std::vector<ExecNode>& nodes, const NodeId root_id, const std::vector<SyncPlan>& sync_plans,
             const std::vector<ProjectPlan>& project_plans,
-            std::vector<std::vector<mata::OnTheFlyAlphabet>>& level_alphabets,
+            std::vector<SmallVec2<mata::OnTheFlyAlphabet>>& level_alphabets,
             const std::vector<mata::OnTheFlyAlphabet>* root_level_alphabets) {
+        // Assign a flat integer index to each (node_id, level) pair so union-find can use plain arrays.
         std::vector<size_t> level_offsets(nodes.size() + 1, 0);
         for (size_t node_id = 0; node_id < nodes.size(); ++node_id) {
             level_offsets[node_id + 1] = level_offsets[node_id] + nodes[node_id].result_arity;
@@ -109,6 +110,7 @@ namespace {
             return level_offsets[node_id] + level;
         };
 
+        // Path-compressing find: locate the representative, then flatten the path to it.
         auto find_root = [&](size_t idx) {
             size_t root = idx;
             while (parent[root] != root) {
@@ -144,38 +146,30 @@ namespace {
             const ExecNode& node = nodes[node_id];
 
             switch (node.kind) {
-                case ExecKind::LeafNfa:
-                case ExecKind::LeafNft:
-                case ExecKind::Arity2LeafNft:
+                case NodeKind::LeafNfa:
+                case NodeKind::LeafNft:
                     break;
 
-                case ExecKind::Union:
-                case ExecKind::Intersect:
-                case ExecKind::Arity1Union:
-                case ExecKind::Arity1Intersect:
-                case ExecKind::Arity2Union:
-                case ExecKind::Arity2Intersect:
+                case NodeKind::Union:
+                case NodeKind::Intersect:
                     for (uint8_t level = 0; level < node.result_arity; ++level) {
                         unite(level_index(node_id, level), level_index(node.lhs, level));
                         unite(level_index(node_id, level), level_index(node.rhs, level));
                     }
                     break;
 
-                case ExecKind::Complement:
-                case ExecKind::Arity1Complement:
-                case ExecKind::Arity2Complement:
+                case NodeKind::Complement:
                     for (uint8_t level = 0; level < node.result_arity; ++level) {
                         unite(level_index(node_id, level), level_index(node.lhs, level));
                     }
                     break;
 
-                case ExecKind::Identity:
+                case NodeKind::Identity:
                     unite(level_index(node_id, 0), level_index(node.lhs, 0));
                     unite(level_index(node_id, 1), level_index(node.lhs, 0));
                     break;
 
-                case ExecKind::Project:
-                case ExecKind::Arity2Project: {
+                case NodeKind::Project: {
                     const ProjectPlan& plan = project_plans[node.payload];
                     for (uint8_t level = 0; level < node.result_arity; ++level) {
                         unite(level_index(node_id, level), level_index(node.lhs, plan.kept_levels[level]));
@@ -183,8 +177,7 @@ namespace {
                     break;
                 }
 
-                case ExecKind::SyncProduct:
-                case ExecKind::Arity2SyncProduct: {
+                case NodeKind::SyncProduct: {
                     const SyncPlan& plan = sync_plans[node.payload];
                     for (size_t i = 0; i < plan.lhs_sync_levels.size(); ++i) {
                         unite(level_index(node.lhs, plan.lhs_sync_levels[i]),
@@ -202,6 +195,7 @@ namespace {
             }
         }
 
+        // One canonical alphabet per equivalence class root; accumulate all local symbols into it.
         std::vector<mata::OnTheFlyAlphabet> canonical_alphabets(total_levels);
         for (size_t node_index = 0; node_index < nodes.size(); ++node_index) {
             const NodeId node_id = static_cast<NodeId>(node_index);
@@ -230,9 +224,79 @@ namespace {
         }
     }
 
+    void compute_effective_symbol_lists(
+            const std::vector<ExecNode>& nodes, const std::vector<ProjectPlan>& project_plans,
+            const std::vector<SmallVec2<std::vector<mata::Symbol>>>& symbol_lists,
+            std::vector<SmallVec2<std::vector<mata::Symbol>>>& effective) {
+        effective.resize(nodes.size());
+
+        // nodes are in topological order (children before parents), so a single forward pass suffices.
+        for (NodeId node_id = 0; node_id < static_cast<NodeId>(nodes.size()); ++node_id) {
+            const ExecNode& node = nodes[node_id];
+            effective[node_id].resize(node.result_arity);
+
+            switch (node.kind) {
+                case NodeKind::LeafNfa:
+                case NodeKind::LeafNft:
+                    for (uint8_t level = 0; level < node.result_arity; ++level) {
+                        effective[node_id][level] = symbol_lists[node_id][level];
+                    }
+                    break;
+
+                case NodeKind::Complement:
+                    // Complement explicitly sweeps all canonical symbols → full alphabet.
+                    for (uint8_t level = 0; level < node.result_arity; ++level) {
+                        effective[node_id][level] = symbol_lists[node_id][level];
+                    }
+                    break;
+
+                case NodeKind::Union:
+                    for (uint8_t level = 0; level < node.result_arity; ++level) {
+                        const auto& lhs = effective[node.lhs][level];
+                        const auto& rhs = effective[node.rhs][level];
+                        auto& result = effective[node_id][level];
+                        result.reserve(lhs.size() + rhs.size());
+                        std::set_union(lhs.begin(), lhs.end(), rhs.begin(), rhs.end(), std::back_inserter(result));
+                    }
+                    break;
+
+                case NodeKind::Intersect:
+                    for (uint8_t level = 0; level < node.result_arity; ++level) {
+                        const auto& lhs = effective[node.lhs][level];
+                        const auto& rhs = effective[node.rhs][level];
+                        auto& result = effective[node_id][level];
+                        result.reserve(std::min(lhs.size(), rhs.size()));
+                        std::set_intersection(
+                                lhs.begin(), lhs.end(), rhs.begin(), rhs.end(), std::back_inserter(result));
+                    }
+                    break;
+
+                case NodeKind::SyncProduct:
+                    // Conservative: use the full canonical alphabet.
+                    for (uint8_t level = 0; level < node.result_arity; ++level) {
+                        effective[node_id][level] = symbol_lists[node_id][level];
+                    }
+                    break;
+
+                case NodeKind::Identity:
+                    effective[node_id][0] = effective[node.lhs][0];
+                    effective[node_id][1] = effective[node.lhs][0];
+                    break;
+
+                case NodeKind::Project: {
+                    const ProjectPlan& plan = project_plans[node.payload];
+                    for (uint8_t level = 0; level < node.result_arity; ++level) {
+                        effective[node_id][level] = effective[node.lhs][plan.kept_levels[level]];
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
 } // namespace
 
-std::string AlphabetStore::symbol_name_for(mata::Alphabet* alphabet, const mata::Symbol symbol) {
+std::string AlphabetStore::symbol_name_for(const mata::Alphabet* alphabet, const mata::Symbol symbol) {
     if (alphabet == nullptr) {
         return std::to_string(symbol);
     }
@@ -248,21 +312,28 @@ AlphabetStore::AlphabetStore(
     std::vector<bool> visited(nodes.size(), false);
     collect_local_level_alphabets(nodes, root_id, nfas, nfts, level_alphabets, visited);
     canonicalize_level_alphabets(nodes, root_id, sync_plans, project_plans, level_alphabets, root_level_alphabets);
+
+    symbol_lists.resize(nodes.size());
+    for (NodeId node_id = 0; node_id < static_cast<NodeId>(nodes.size()); ++node_id) {
+        const uint8_t arity = nodes[node_id].result_arity;
+        symbol_lists[node_id].resize(arity);
+        for (uint8_t level = 0; level < arity; ++level) {
+            symbol_lists[node_id][level] = level_alphabets[node_id][level].get_alphabet_symbols().to_vector();
+        }
+    }
+
+    compute_effective_symbol_lists(nodes, project_plans, symbol_lists, effective_symbol_lists);
 }
 
-bool AlphabetStore::try_translate_local_symbol_to_resolved(
+bool AlphabetStore::try_resolve_symbol(
         const mata::nft::Nft& nft, const uint8_t source_level, const NodeId node_id, const uint8_t result_level,
         const mata::Symbol local_symbol, mata::Symbol& resolved_symbol) const {
     try {
-        const std::string symbol_name =
-                symbol_name_for(const_cast<mata::Alphabet*>(nft.alphabet_of_level(source_level)), local_symbol);
+        const std::string symbol_name = symbol_name_for(nft.alphabet_of_level(source_level), local_symbol);
         return try_translate_symbol_name_to_resolved(node_id, result_level, symbol_name, resolved_symbol);
     } catch (const std::runtime_error&) { return false; }
 }
 
-const mata::OnTheFlyAlphabet& AlphabetStore::level_alphabet(const NodeId node_id, const uint8_t level) const {
-    return level_alphabets[node_id][level];
-}
 
 bool AlphabetStore::try_translate_symbol_name_to_resolved(
         const NodeId node_id, const uint8_t level, const std::string& symbol_name,

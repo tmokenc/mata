@@ -7,37 +7,37 @@
 
 #include "state_types.hh"
 
+#include <type_traits>
 #include <unordered_set>
 
 namespace mata::nft::lazy::detail {
 
-bool levels_unique(const std::vector<uint8_t>& levels) {
-    std::unordered_set<uint8_t> seen{};
-    for (const uint8_t level : levels) {
-        if (seen.contains(level)) {
-            return false;
+namespace {
+    template<typename T, typename KeyFn>
+    bool all_unique(const std::vector<T>& items, KeyFn key) {
+        using Key = std::invoke_result_t<KeyFn&, const T&>;
+        std::unordered_set<Key> seen{};
+        for (const T& item : items) {
+            if (!seen.insert(key(item)).second) {
+                return false;
+            }
         }
-        seen.insert(level);
+        return true;
     }
-    return true;
+} // namespace
+
+bool levels_unique(const std::vector<uint8_t>& levels) {
+    return all_unique(levels, [](uint8_t l) { return l; });
 }
 
 bool level_refs_unique(const std::vector<LevelRef>& refs) {
-    std::unordered_set<uint16_t> seen{};
-    for (const LevelRef ref : refs) {
-        const uint16_t packed =
-                (static_cast<uint16_t>(static_cast<uint8_t>(ref.side)) << 8) | static_cast<uint16_t>(ref.level);
-        if (seen.contains(packed)) {
-            return false;
-        }
-        seen.insert(packed);
-    }
-    return true;
+    return all_unique(refs, [](LevelRef ref) -> uint16_t {
+        return static_cast<uint16_t>((static_cast<unsigned>(ref.side) << 8) | static_cast<unsigned>(ref.level));
+    });
 }
 
 namespace {
-
-    bool validate_sync_plan(const SymbolicAutomataTree& tree, const Node& node, const SyncPlan& plan) {
+    bool validate_sync_plan(const SymbolicFormula& tree, const Node& node, const SyncPlan& plan) {
         if (plan.lhs_sync_levels.size() != plan.rhs_sync_levels.size()) {
             return false;
         }
@@ -75,7 +75,7 @@ namespace {
         return node.result_arity == plan.result_layout.size();
     }
 
-    bool validate_project_plan(const SymbolicAutomataTree& tree, const Node& node, const ProjectPlan& plan) {
+    bool validate_project_plan(const SymbolicFormula& tree, const Node& node, const ProjectPlan& plan) {
         const uint8_t child_arity = tree.nodes[node.lhs].result_arity;
         if (!levels_unique(plan.kept_levels)) {
             return false;
@@ -90,7 +90,7 @@ namespace {
         return node.result_arity == plan.kept_levels.size();
     }
 
-    bool validate_node(const SymbolicAutomataTree& tree, const NodeId node_id, std::vector<VisitState>& marks) {
+    bool validate_node(const SymbolicFormula& tree, const NodeId node_id, std::vector<VisitState>& marks) {
         if (node_id >= tree.nodes.size()) {
             return false;
         }
@@ -151,10 +151,9 @@ namespace {
         marks[node_id] = ok ? VisitState::Done : VisitState::Unseen;
         return ok;
     }
-
 } // namespace
 
-bool is_valid(const SymbolicAutomataTree& tree, const Term& root_node) {
+bool is_valid(const SymbolicFormula& tree, const Term& root_node) {
     std::vector<VisitState> marks(tree.nodes.size(), VisitState::Unseen);
     return validate_node(tree, root_node.get_id(), marks);
 }

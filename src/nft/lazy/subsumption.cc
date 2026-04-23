@@ -8,35 +8,31 @@
 #include "mata/nfa/algorithms.hh"
 #include "mata/nft/algorithms.hh"
 
+#include <algorithm>
+#include <iostream>
+
 namespace mata::nft::lazy::detail {
 
-std::optional<bool> SubsumptionCache::get(MacroStateId state1, MacroStateId state2) const {
-    auto it = cache.find({state1, state2});
-
-    if (it != cache.end()) {
-        return it->second;
-    }
-
-    return std::nullopt;
-}
-
-void SubsumptionCache::set(MacroStateId state1, MacroStateId state2, bool result) { cache[{state1, state2}] = result; }
-
 SubsumptionEngine::SubsumptionEngine(const SubsumptionContext& context)
-    : nfas{context.nfas}, nfts{context.nfts}, nodes{context.nodes}, macro_store{context.macro_store},
-      precomputed_simulation_nfas(context.nfas.size()), precomputed_simulation_nfts(context.nfts.size()), antichain{},
-      antichain_buckets{}, caches{} {}
+    : context(context), precomputed_simulation_nfas(context.nfas.size()),
+      precomputed_simulation_nfts(context.nfts.size()), antichain{}, buckets{}, caches{}, filter_lhs_nfa_index{},
+      lhs_fwd_sim_neighbors{}, lhs_bwd_sim_neighbors{} {}
 
 void SubsumptionEngine::initialize_leaf_simulations(const NodeId root_id) {
     antichain.clear();
-    antichain_buckets.clear();
+    buckets.clear();
     caches.clear();
-    caches.resize(nodes.size());
+    caches.resize(context.nodes.size());
+    lhs_fwd_sim_neighbors.clear();
+    lhs_bwd_sim_neighbors.clear();
+    filter_lhs_nfa_index = std::nullopt;
 
     configure_antichain_filter(root_id);
 
-    std::vector<bool> visited(nodes.size(), false);
+    std::vector<bool> visited(context.nodes.size(), false);
     initialize_leaf_simulations_impl(root_id, visited);
+
+    build_lhs_sim_neighbors();
 }
 
 void SubsumptionEngine::configure_antichain_filter(const NodeId root_id) {
@@ -44,36 +40,39 @@ void SubsumptionEngine::configure_antichain_filter(const NodeId root_id) {
     filter_kind = AntichainFilterKind::None;
     filter_fingerprint_source_node = root_id;
 
-    if (root_id >= nodes.size()) {
+    if (root_id >= context.nodes.size()) {
         return;
     }
 
-    const ExecKind root_kind = nodes[root_id].kind;
+    const NodeKind root_kind = context.nodes[root_id].kind;
     switch (root_kind) {
-        case ExecKind::Union:
-        case ExecKind::Arity1Union:
-        case ExecKind::Arity2Union:
+        case NodeKind::Union:
+            // Subsumption requires matching tags — use the tag as a discriminator so only
+            // same-side entries are compared.
             filter_kind = AntichainFilterKind::Tag;
             break;
 
-        case ExecKind::Complement:
-        case ExecKind::Arity1Complement:
-        case ExecKind::Arity2Complement:
+        case NodeKind::Complement:
+            // Subsumption for complement reverses the subset order: s1 ⊑ s2 iff sub(s2) ⊆ sub(s1).
+            // Smaller set states can only subsume larger or equal ones, so bucket by set size and
+            // check only entries with size ≤ the query.
             filter_kind = AntichainFilterKind::RootSetSize;
             break;
 
-        case ExecKind::Intersect:
-        case ExecKind::SyncProduct:
-        case ExecKind::Arity1Intersect:
-        case ExecKind::Arity2Intersect:
-        case ExecKind::Arity2SyncProduct: {
-            const NodeId rhs = nodes[root_id].rhs;
-            if (rhs < nodes.size()) {
-                const ExecKind rhs_kind = nodes[rhs].kind;
-                if (rhs_kind == ExecKind::Complement || rhs_kind == ExecKind::Arity1Complement ||
-                    rhs_kind == ExecKind::Arity2Complement) {
-                    filter_kind = AntichainFilterKind::IntersectRhsSetSize;
-                    filter_fingerprint_source_node = rhs;
+        case NodeKind::Intersect:
+        case NodeKind::SyncProduct: {
+            // Language-inclusion pattern: Intersect(L, Complement(R)).  The rhs set state grows as
+            // the search progresses; bucket by its size for the same reason as RootSetSize.
+            const NodeId rhs = context.nodes[root_id].rhs;
+            if (rhs < context.nodes.size() && context.nodes[rhs].kind == NodeKind::Complement) {
+                filter_kind = AntichainFilterKind::IntersectRhsSetSize;
+                filter_fingerprint_source_node = rhs;
+
+                // When the lhs is a plain NFA leaf we can also exploit its simulation relation to
+                // widen the antichain check across simulated lhs states.
+                const NodeId lhs = context.nodes[root_id].lhs;
+                if (context.nodes[lhs].kind == NodeKind::LeafNfa) {
+                    filter_lhs_nfa_index = context.nodes[lhs].lhs;
                 }
             }
             break;
@@ -87,14 +86,14 @@ void SubsumptionEngine::configure_antichain_filter(const NodeId root_id) {
 uint32_t SubsumptionEngine::compute_fingerprint(const MacroStateId state) const {
     switch (filter_kind) {
         case AntichainFilterKind::Tag:
-            return static_cast<uint32_t>(macro_store.get_tagged(filter_root_node, state).tag);
+            return static_cast<uint32_t>(context.macro_store.get_tagged(filter_root_node, state).tag);
 
         case AntichainFilterKind::RootSetSize:
-            return static_cast<uint32_t>(macro_store.get_set(filter_root_node, state).size());
+            return static_cast<uint32_t>(context.macro_store.get_set(filter_root_node, state).size());
 
         case AntichainFilterKind::IntersectRhsSetSize: {
-            const PairState pair = macro_store.get_pair(filter_root_node, state);
-            return static_cast<uint32_t>(macro_store.get_set(filter_fingerprint_source_node, pair.rhs).size());
+            const PairState pair = context.macro_store.get_pair(filter_root_node, state);
+            return static_cast<uint32_t>(context.macro_store.get_set(filter_fingerprint_source_node, pair.rhs).size());
         }
 
         case AntichainFilterKind::None:
@@ -104,30 +103,65 @@ uint32_t SubsumptionEngine::compute_fingerprint(const MacroStateId state) const 
     return 0;
 }
 
-bool SubsumptionEngine::fingerprint_can_subsume(const uint32_t entry_fp, const uint32_t state_fp) const noexcept {
-    switch (filter_kind) {
-        case AntichainFilterKind::Tag:
-            return entry_fp == state_fp;
-        case AntichainFilterKind::RootSetSize:
-        case AntichainFilterKind::IntersectRhsSetSize:
-            return entry_fp <= state_fp;
-        case AntichainFilterKind::None:
-            break;
-    }
-    return true;
+SubsumptionEngine::InnerBuckets& SubsumptionEngine::inner_bucket(const MacroStateId state) {
+    const MacroStateId key = (filter_kind == AntichainFilterKind::IntersectRhsSetSize)
+                                     ? context.macro_store.get_pair(filter_root_node, state).lhs
+                                     : MacroStateId{0};
+    return buckets[key];
 }
 
-bool SubsumptionEngine::fingerprint_can_be_subsumed(const uint32_t entry_fp, const uint32_t state_fp) const noexcept {
+std::vector<MacroStateId>& SubsumptionEngine::get_or_insert_bucket(InnerBuckets& inner, const uint32_t key) {
+    const auto cmp = [](const InnerBucket& b, uint32_t k) { return b.first < k; };
+    auto it = std::lower_bound(inner.begin(), inner.end(), key, cmp);
+    if (it == inner.end() || it->first != key) {
+        it = inner.insert(it, {key, {}});
+    }
+    return it->second;
+}
+
+// check_range: the buckets that might contain an antichain entry subsuming the query state.
+// remove_range: the buckets that might contain entries the query state now makes redundant.
+//
+// For Tag: subsumption requires equal tags, so only the exact-match bucket matters for both.
+// For set-size filters: s2 subsumes s1 iff sub(s2) ⊆ sub(s1), which means sub(s2) can be no
+// larger than sub(s1).  So:
+//   - check: candidates have size ≤ fp  (smaller or equal sets can subsume the query)
+//   - remove: candidates have size ≥ fp  (larger or equal sets may now be dominated)
+
+SubsumptionEngine::BucketsRange SubsumptionEngine::check_range(InnerBuckets& inner, const uint32_t fp) const {
+    const auto lower_cmp = [](const InnerBucket& b, uint32_t k) { return b.first < k; };
     switch (filter_kind) {
-        case AntichainFilterKind::Tag:
-            return entry_fp == state_fp;
+        case AntichainFilterKind::Tag: {
+            const auto it = std::lower_bound(inner.begin(), inner.end(), fp, lower_cmp);
+            return (it != inner.end() && it->first == fp) ? BucketsRange{it, std::next(it)}
+                                                          : BucketsRange{inner.end(), inner.end()};
+        }
+        case AntichainFilterKind::RootSetSize:
+        case AntichainFilterKind::IntersectRhsSetSize: {
+            const auto upper_cmp = [](uint32_t k, const InnerBucket& b) { return k < b.first; };
+            return {inner.begin(), std::upper_bound(inner.begin(), inner.end(), fp, upper_cmp)};
+        }
+        case AntichainFilterKind::None:
+            return {inner.begin(), inner.end()};
+    }
+    return {inner.begin(), inner.end()};
+}
+
+SubsumptionEngine::BucketsRange SubsumptionEngine::remove_range(InnerBuckets& inner, const uint32_t fp) const {
+    const auto lower_cmp = [](const InnerBucket& b, uint32_t k) { return b.first < k; };
+    switch (filter_kind) {
+        case AntichainFilterKind::Tag: {
+            const auto it = std::lower_bound(inner.begin(), inner.end(), fp, lower_cmp);
+            return (it != inner.end() && it->first == fp) ? BucketsRange{it, std::next(it)}
+                                                          : BucketsRange{inner.end(), inner.end()};
+        }
         case AntichainFilterKind::RootSetSize:
         case AntichainFilterKind::IntersectRhsSetSize:
-            return entry_fp >= state_fp;
+            return {std::lower_bound(inner.begin(), inner.end(), fp, lower_cmp), inner.end()};
         case AntichainFilterKind::None:
-            break;
+            return {inner.begin(), inner.end()};
     }
-    return true;
+    return {inner.begin(), inner.end()};
 }
 
 void SubsumptionEngine::initialize_leaf_simulations_impl(const NodeId node_id, std::vector<bool>& visited) {
@@ -135,40 +169,31 @@ void SubsumptionEngine::initialize_leaf_simulations_impl(const NodeId node_id, s
         return;
     }
 
-    const ExecNode& node = nodes[node_id];
+    const ExecNode& node = context.nodes[node_id];
 
     switch (node.kind) {
-        case ExecKind::LeafNfa: {
-            Simlib::Util::BinaryRelation relation = mata::nfa::algorithms::compute_relation(nfas[node.lhs]);
+        case NodeKind::LeafNfa: {
+            Simlib::Util::BinaryRelation relation = mata::nfa::algorithms::compute_relation(context.nfas[node.lhs]);
             precomputed_simulation_nfas[node.lhs] = std::move(relation);
             break;
         }
 
-        case ExecKind::LeafNft:
-        case ExecKind::Arity2LeafNft: {
-            Simlib::Util::BinaryRelation relation = mata::nft::algorithms::compute_relation(nfts[node.lhs]);
+        case NodeKind::LeafNft: {
+            Simlib::Util::BinaryRelation relation = mata::nft::algorithms::compute_relation(context.nfts[node.lhs]);
             precomputed_simulation_nfts[node.lhs] = std::move(relation);
             break;
         }
 
-        case ExecKind::Union:
-        case ExecKind::Intersect:
-        case ExecKind::Arity1Union:
-        case ExecKind::Arity1Intersect:
-        case ExecKind::Arity2Union:
-        case ExecKind::Arity2Intersect:
-        case ExecKind::SyncProduct:
-        case ExecKind::Arity2SyncProduct:
+        case NodeKind::Union:
+        case NodeKind::Intersect:
+        case NodeKind::SyncProduct:
             initialize_leaf_simulations_impl(node.lhs, visited);
             initialize_leaf_simulations_impl(node.rhs, visited);
             break;
 
-        case ExecKind::Complement:
-        case ExecKind::Identity:
-        case ExecKind::Project:
-        case ExecKind::Arity1Complement:
-        case ExecKind::Arity2Complement:
-        case ExecKind::Arity2Project:
+        case NodeKind::Complement:
+        case NodeKind::Identity:
+        case NodeKind::Project:
             initialize_leaf_simulations_impl(node.lhs, visited);
             break;
     }
@@ -181,30 +206,27 @@ bool SubsumptionEngine::subsumed_state(const NodeId node_id, const MacroStateId 
         return true;
     }
 
-    const ExecNode& node = nodes[node_id];
+    const ExecNode& node = context.nodes[node_id];
     const State s1 = static_cast<State>(state1);
     const State s2 = static_cast<State>(state2);
     bool result = false;
 
     switch (node.kind) {
-        case ExecKind::LeafNfa:
+        case NodeKind::LeafNfa:
             result = precomputed_simulation_nfas[node.lhs].get(s1, s2);
             break;
 
-        case ExecKind::LeafNft:
-        case ExecKind::Arity2LeafNft:
+        case NodeKind::LeafNft:
             result = precomputed_simulation_nfts[node.lhs].get(s1, s2);
             break;
 
-        case ExecKind::Union:
-        case ExecKind::Arity1Union:
-        case ExecKind::Arity2Union: {
+        case NodeKind::Union: {
             if (const std::optional<bool> cached_result = caches[node_id].get(state1, state2)) {
                 return *cached_result;
             }
 
-            const TaggedState tagged1 = macro_store.get_tagged(node_id, state1);
-            const TaggedState tagged2 = macro_store.get_tagged(node_id, state2);
+            const TaggedState tagged1 = context.macro_store.get_tagged(node_id, state1);
+            const TaggedState tagged2 = context.macro_store.get_tagged(node_id, state2);
             if (tagged1.tag != tagged2.tag) {
                 result = false;
                 break;
@@ -216,32 +238,29 @@ bool SubsumptionEngine::subsumed_state(const NodeId node_id, const MacroStateId 
             break;
         }
 
-        case ExecKind::Intersect:
-        case ExecKind::SyncProduct:
-        case ExecKind::Arity1Intersect:
-        case ExecKind::Arity2Intersect:
-        case ExecKind::Arity2SyncProduct: {
+        case NodeKind::Intersect:
+        case NodeKind::SyncProduct: {
             if (const std::optional<bool> cached_result = caches[node_id].get(state1, state2)) {
                 return *cached_result;
             }
 
-            const PairState pair1 = macro_store.get_pair(node_id, state1);
-            const PairState pair2 = macro_store.get_pair(node_id, state2);
+            const PairState pair1 = context.macro_store.get_pair(node_id, state1);
+            const PairState pair2 = context.macro_store.get_pair(node_id, state2);
 
             result = subsumed_state(node.lhs, pair1.lhs, pair2.lhs) && subsumed_state(node.rhs, pair1.rhs, pair2.rhs);
             caches[node_id].set(state1, state2, result);
             break;
         }
 
-        case ExecKind::Complement:
-        case ExecKind::Arity1Complement:
-        case ExecKind::Arity2Complement: {
+        case NodeKind::Complement: {
             if (const std::optional<bool> cached_result = caches[node_id].get(state1, state2)) {
                 return *cached_result;
             }
 
-            const SetState& lhs_sub_states = macro_store.get_set(node_id, state2);
-            const SetState& rhs_sub_states = macro_store.get_set(node_id, state1);
+            // Complement reverses the subsumption order: complement(s1) ⊑ complement(s2) iff
+            // sub(s2) ⊆ sub(s1).  The argument roles are therefore intentionally swapped here.
+            const SetState& lhs_sub_states = context.macro_store.get_set(node_id, state2);
+            const SetState& rhs_sub_states = context.macro_store.get_set(node_id, state1);
 
             if (lhs_sub_states.size() > rhs_sub_states.size()) {
                 result = false;
@@ -251,6 +270,7 @@ bool SubsumptionEngine::subsumed_state(const NodeId node_id, const MacroStateId 
             result = true;
             for (const MacroStateId lhs_sub_state : lhs_sub_states) {
                 bool subsumed = false;
+
                 for (const MacroStateId rhs_sub_state : rhs_sub_states) {
                     if (subsumed_state(node.lhs, lhs_sub_state, rhs_sub_state)) {
                         subsumed = true;
@@ -269,9 +289,8 @@ bool SubsumptionEngine::subsumed_state(const NodeId node_id, const MacroStateId 
             break;
         }
 
-        case ExecKind::Identity:
-        case ExecKind::Project:
-        case ExecKind::Arity2Project:
+        case NodeKind::Identity:
+        case NodeKind::Project:
             result = subsumed_state(node.lhs, state1, state2);
             break;
     }
@@ -279,77 +298,102 @@ bool SubsumptionEngine::subsumed_state(const NodeId node_id, const MacroStateId 
     return result;
 }
 
-bool SubsumptionEngine::is_subsumed(const NodeId root_id, const MacroStateId state) {
-    const uint32_t state_fp = compute_fingerprint(state);
+void SubsumptionEngine::build_lhs_sim_neighbors() {
+    if (!filter_lhs_nfa_index.has_value())
+        return;
 
-    auto check_subsumption = [&](auto it_begin, auto it_end) {
-        for (auto it = it_begin; it != it_end; ++it) {
-            for (const MacroStateId entry : it->second) {
-                if (subsumed_state(root_id, state, entry)) {
-                    return true;
+    const size_t nfa_idx = *filter_lhs_nfa_index;
+    const Simlib::Util::BinaryRelation& sim = precomputed_simulation_nfas[nfa_idx];
+    const size_t n = context.nfas[nfa_idx].num_of_states();
+
+    lhs_fwd_sim_neighbors.resize(n);
+    lhs_bwd_sim_neighbors.resize(n);
+
+    // TODO: Should unroll this loop?
+    for (size_t q = 0; q < n; ++q) {
+        for (size_t q2 = 0; q2 < n; ++q2) {
+            if (sim.get(q, q2))
+                lhs_fwd_sim_neighbors[q].push_back(static_cast<MacroStateId>(q2));
+            if (sim.get(q2, q))
+                lhs_bwd_sim_neighbors[q].push_back(static_cast<MacroStateId>(q2));
+        }
+    }
+}
+
+bool SubsumptionEngine::is_subsumed_with_lhs_sim(const NodeId root_id, const MacroStateId state, const uint32_t fp) {
+    const MacroStateId lhs = context.macro_store.get_pair(filter_root_node, state).lhs;
+
+    // Check: find any antichain entry (q', S') in outer bucket q' where lhs ≤_sim q'.
+    if (lhs < static_cast<MacroStateId>(lhs_fwd_sim_neighbors.size())) {
+        for (const MacroStateId sim_key : lhs_fwd_sim_neighbors[lhs]) {
+            const auto outer_it = buckets.find(sim_key);
+            if (outer_it == buckets.end())
+                continue;
+            auto [cb, ce] = check_range(outer_it->second, fp);
+            for (auto it = cb; it != ce; ++it) {
+                for (const MacroStateId entry : it->second) {
+                    if (subsumed_state(root_id, state, entry))
+                        return true;
                 }
             }
         }
-        return false;
-    };
-
-    switch (filter_kind) {
-        case AntichainFilterKind::Tag:
-            if (auto it = antichain_buckets.find(state_fp); it != antichain_buckets.end()) {
-                if (check_subsumption(it, std::next(it))) {
-                    return true;
-                }
-            }
-            break;
-
-        case AntichainFilterKind::RootSetSize:
-        case AntichainFilterKind::IntersectRhsSetSize:
-            // fingerprint_can_subsume: entry_fp <= state_fp
-            if (check_subsumption(antichain_buckets.begin(), antichain_buckets.upper_bound(state_fp))) {
-                return true;
-            }
-            break;
-
-        case AntichainFilterKind::None:
-            if (check_subsumption(antichain_buckets.begin(), antichain_buckets.end())) {
-                return true;
-            }
-            break;
     }
 
-    auto remove_subsumed = [&](auto it_begin, auto it_end) {
-        for (auto it = it_begin; it != it_end; ++it) {
-            std::erase_if(it->second, [&](const MacroStateId entry) {
-                if (subsumed_state(root_id, entry, state)) {
-                    antichain.erase(entry);
-                    return true;
-                }
-                return false;
-            });
-        }
-    };
-
-    switch (filter_kind) {
-        case AntichainFilterKind::Tag:
-            if (auto it = antichain_buckets.find(state_fp); it != antichain_buckets.end()) {
-                remove_subsumed(it, std::next(it));
+    // Remove: find antichain entries (q', S') in outer bucket q' where q' ≤_sim lhs.
+    if (lhs < static_cast<MacroStateId>(lhs_bwd_sim_neighbors.size())) {
+        for (const MacroStateId sim_key : lhs_bwd_sim_neighbors[lhs]) {
+            const auto outer_it = buckets.find(sim_key);
+            if (outer_it == buckets.end())
+                continue;
+            auto [rb, re] = remove_range(outer_it->second, fp);
+            for (auto it = rb; it != re; ++it) {
+                std::erase_if(it->second, [&](const MacroStateId entry) {
+                    if (subsumed_state(root_id, entry, state)) {
+                        antichain.erase(entry);
+                        return true;
+                    }
+                    return false;
+                });
             }
-            break;
+        }
+    }
 
-        case AntichainFilterKind::RootSetSize:
-        case AntichainFilterKind::IntersectRhsSetSize:
-            // fingerprint_can_be_subsumed: entry_fp >= state_fp
-            remove_subsumed(antichain_buckets.lower_bound(state_fp), antichain_buckets.end());
-            break;
+    InnerBuckets& inner = inner_bucket(state);
+    antichain.insert(state);
+    get_or_insert_bucket(inner, fp).push_back(state);
+    return false;
+}
 
-        case AntichainFilterKind::None:
-            remove_subsumed(antichain_buckets.begin(), antichain_buckets.end());
-            break;
+bool SubsumptionEngine::is_subsumed(const NodeId root_id, const MacroStateId state) {
+    const uint32_t fp = compute_fingerprint(state);
+
+    if (!lhs_fwd_sim_neighbors.empty()) {
+        return is_subsumed_with_lhs_sim(root_id, state, fp);
+    }
+
+    InnerBuckets& inner = inner_bucket(state);
+
+    auto [cb, ce] = check_range(inner, fp);
+    for (auto it = cb; it != ce; ++it) {
+        for (const MacroStateId entry : it->second) {
+            if (subsumed_state(root_id, state, entry))
+                return true;
+        }
+    }
+
+    auto [rb, re] = remove_range(inner, fp);
+    for (auto it = rb; it != re; ++it) {
+        std::erase_if(it->second, [&](const MacroStateId entry) {
+            if (subsumed_state(root_id, entry, state)) {
+                antichain.erase(entry);
+                return true;
+            }
+            return false;
+        });
     }
 
     antichain.insert(state);
-    antichain_buckets[state_fp].push_back(state);
-
+    get_or_insert_bucket(inner, fp).push_back(state);
     return false;
 }
 
@@ -387,17 +431,14 @@ void SubsumptionEngine::print_statistics() const {
     size_t cached_true = 0;
 
     for (const SubsumptionCache& cache : caches) {
-        cache_stored += cache.cache.size();
-        for (const auto& [_, result] : cache.cache) {
-            if (result) {
-                ++cached_true;
-            }
-        }
+        cache_stored += cache.size();
+        cached_true += cache.count_true();
     }
 
     std::cout << "Subsumption cache size: " << cache_stored << std::endl;
     std::cout << "Subsumption cache true ratio: "
-              << (cache_stored == 0 ? 0 : static_cast<double>(cached_true) / cache_stored) << std::endl;
+              << (cache_stored == 0 ? 0 : static_cast<double>(cached_true) / static_cast<double>(cache_stored))
+              << std::endl;
     std::cout << "Current antichain size: " << antichain.size() << std::endl;
 }
 

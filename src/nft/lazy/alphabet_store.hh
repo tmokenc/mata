@@ -28,7 +28,13 @@ class AlphabetStore {
     bool try_translate_symbol_name_to_resolved(
             NodeId node_id, uint8_t level, const std::string& symbol_name, mata::Symbol& resolved_symbol) const;
 
-    std::vector<std::vector<mata::OnTheFlyAlphabet>> level_alphabets{};
+    /// Resolved alphabet for each (node, level) pair — translated into the unified symbol namespace.
+    std::vector<SmallVec2<mata::OnTheFlyAlphabet>> level_alphabets{};
+    /// Sorted symbol list for each (node, level) pair, derived from the resolved alphabets.
+    std::vector<SmallVec2<std::vector<mata::Symbol>>> symbol_lists{};
+    /// Effective symbol list for each (node, level) pair: the subset of canonical symbols that the
+    /// node's subtree can actually produce (intersection propagated bottom-up through Intersect nodes).
+    std::vector<SmallVec2<std::vector<mata::Symbol>>> effective_symbol_lists{};
 
 public:
     /**
@@ -63,7 +69,7 @@ public:
      * @return `true` if the symbol is present in the resolved alphabet, `false` otherwise.
      */
     template<typename Automaton>
-    bool try_translate_local_symbol_to_resolved(
+    bool try_resolve_symbol(
             const Automaton& automaton, NodeId node_id, uint8_t level, mata::Symbol local_symbol,
             mata::Symbol& resolved_symbol) const {
         try {
@@ -82,17 +88,19 @@ public:
      * @param resolved_symbol Output parameter receiving the translated symbol on success.
      * @return `true` if the symbol is present in the resolved alphabet, `false` otherwise.
      */
-    bool try_translate_local_symbol_to_resolved(
+    bool try_resolve_symbol(
             const mata::nft::Nft& nft, uint8_t source_level, NodeId node_id, uint8_t result_level,
             mata::Symbol local_symbol, mata::Symbol& resolved_symbol) const;
 
-    /**
-     * @brief Get the resolved visible alphabet for one node level.
-     * @param node_id Reconstructed exec node id.
-     * @param level Visible level within the node.
-     * @return Resolved visible alphabet stored for the requested node level.
-     */
-    const mata::OnTheFlyAlphabet& level_alphabet(NodeId node_id, uint8_t level) const;
+    const mata::OnTheFlyAlphabet& level_alphabet(NodeId node_id, uint8_t level) const {
+        return level_alphabets[node_id][level];
+    }
+
+    const SmallVec2<std::vector<mata::Symbol>>& level_symbols(NodeId node_id) const { return symbol_lists[node_id]; }
+
+    const SmallVec2<std::vector<mata::Symbol>>& effective_level_symbols(NodeId node_id) const {
+        return effective_symbol_lists[node_id];
+    }
 
     /**
      * @brief Convert a symbol to its stable visible name.
@@ -100,7 +108,7 @@ public:
      * @param symbol Symbol value to stringify.
      * @return Stable visible name, or the numeric symbol value when reverse translation is unavailable.
      */
-    static std::string symbol_name_for(mata::Alphabet* alphabet, mata::Symbol symbol);
+    static std::string symbol_name_for(const mata::Alphabet* alphabet, mata::Symbol symbol);
 };
 
 } // namespace mata::nft::lazy::detail

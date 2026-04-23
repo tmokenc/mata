@@ -50,6 +50,9 @@ MacroStateId MacroStateStore::PairStore::intern(const PairState pair) {
         return id;
     }
 
+    // Sparse path: use the hash as the initial key; advance linearly on collision.
+    // The key stored in `sparse_pairs` IS the macrostate ID, so callers can use the
+    // returned id directly to look up the pair without a second indirection.
     MacroStateId id = hash_pair(pair);
     while (true) {
         const auto it = sparse_pairs.find(id);
@@ -77,29 +80,20 @@ MacroStateStore::MacroStateStore(
     size_t tagged_node_count = 0;
     for (const ExecNode& node : nodes) {
         switch (node.kind) {
-            case ExecKind::Union:
-            case ExecKind::Arity1Union:
-            case ExecKind::Arity2Union:
+            case NodeKind::Union:
                 tagged_node_count += 1;
                 break;
-            case ExecKind::Intersect:
-            case ExecKind::SyncProduct:
-            case ExecKind::Arity1Intersect:
-            case ExecKind::Arity2Intersect:
-            case ExecKind::Arity2SyncProduct:
+            case NodeKind::Intersect:
+            case NodeKind::SyncProduct:
                 pair_node_count += 1;
                 break;
-            case ExecKind::Complement:
-            case ExecKind::Arity1Complement:
-            case ExecKind::Arity2Complement:
+            case NodeKind::Complement:
                 set_node_count += 1;
                 break;
-            case ExecKind::LeafNfa:
-            case ExecKind::LeafNft:
-            case ExecKind::Identity:
-            case ExecKind::Project:
-            case ExecKind::Arity2LeafNft:
-            case ExecKind::Arity2Project:
+            case NodeKind::LeafNfa:
+            case NodeKind::LeafNft:
+            case NodeKind::Identity:
+            case NodeKind::Project:
                 break;
         }
     }
@@ -107,32 +101,30 @@ MacroStateStore::MacroStateStore(
     set_stores.reserve(set_node_count);
     tagged_stores.reserve(tagged_node_count);
 
+    // Track the maximum number of reachable macrostates for each node.  A leaf's bound is its
+    // state count; a product node's bound is the product of its children's bounds (if finite).
+    // When both children of an Intersect/SyncProduct fit within DENSE_PAIR_MAX_MATRIX_SIZE we can
+    // use a 2D array for O(1) pair lookup instead of a hash map.
     std::vector<std::optional<size_t>> dense_macrostate_bounds(nodes.size(), std::nullopt);
 
     for (size_t i = 0; i < nodes.size(); ++i) {
         switch (nodes[i].kind) {
-            case ExecKind::LeafNfa:
+            case NodeKind::LeafNfa:
                 dense_macrostate_bounds[i] = nfas[nodes[i].lhs].num_of_states();
                 break;
 
-            case ExecKind::LeafNft:
-            case ExecKind::Arity2LeafNft:
+            case NodeKind::LeafNft:
                 dense_macrostate_bounds[i] = nfts[nodes[i].lhs].num_of_states();
                 break;
 
-            case ExecKind::Union:
-            case ExecKind::Arity1Union:
-            case ExecKind::Arity2Union:
+            case NodeKind::Union:
                 node_to_store_index[i] = tagged_stores.size();
                 tagged_stores.emplace_back();
                 dense_macrostate_bounds[i] = std::nullopt;
                 break;
 
-            case ExecKind::Intersect:
-            case ExecKind::SyncProduct:
-            case ExecKind::Arity1Intersect:
-            case ExecKind::Arity2Intersect:
-            case ExecKind::Arity2SyncProduct: {
+            case NodeKind::Intersect:
+            case NodeKind::SyncProduct: {
                 const std::optional<size_t> lhs_bound = dense_macrostate_bounds[nodes[i].lhs];
                 const std::optional<size_t> rhs_bound = dense_macrostate_bounds[nodes[i].rhs];
                 node_to_store_index[i] = pair_stores.size();
@@ -146,45 +138,24 @@ MacroStateStore::MacroStateStore(
                 break;
             }
 
-            case ExecKind::Complement:
-            case ExecKind::Arity1Complement:
-            case ExecKind::Arity2Complement:
+            case NodeKind::Complement:
                 node_to_store_index[i] = set_stores.size();
                 set_stores.emplace_back();
                 dense_macrostate_bounds[i] = std::nullopt;
                 break;
 
-            case ExecKind::Identity:
-            case ExecKind::Project:
-            case ExecKind::Arity2Project:
+            case NodeKind::Identity:
+            case NodeKind::Project:
                 dense_macrostate_bounds[i] = dense_macrostate_bounds[nodes[i].lhs];
                 break;
         }
     }
 }
 
-PairState MacroStateStore::get_pair(const NodeId idx, const MacroStateId id) const {
-    const PairStore& store = pair_stores[node_to_store_index[idx]];
-    return store.get(id);
-}
-
-const SetState& MacroStateStore::get_set(const NodeId idx, const MacroStateId id) const {
-    const SetStore& store = set_stores[node_to_store_index[idx]];
-    const auto it = store.find(id);
-    assert(it != store.end());
-    return it->second;
-}
-
-TaggedState MacroStateStore::get_tagged(const NodeId idx, const MacroStateId id) const {
-    const TaggedStore& store = tagged_stores[node_to_store_index[idx]];
-    const auto it = store.find(id);
-    assert(it != store.end());
-    return it->second;
-}
 
 MacroStateId MacroStateStore::intern(const NodeId idx, SetState states) {
     SetStore& store = set_stores[node_to_store_index[idx]];
-    canonicalize_set_state(states);
+    // Same hash-as-key + linear-probe scheme as PairStore's sparse path.
     MacroStateId id = hash_states(states);
 
     while (true) {
@@ -209,7 +180,7 @@ MacroStateId MacroStateStore::intern(const NodeId idx, const PairState pair) {
 
 MacroStateId MacroStateStore::intern(const NodeId idx, const TaggedState& tagged) {
     TaggedStore& store = tagged_stores[node_to_store_index[idx]];
-    MacroStateId id = hash_tagged(tagged);
+    MacroStateId id = hash_tagged(tagged); // hash-as-key + linear-probe
 
     while (true) {
         const auto it = store.find(id);

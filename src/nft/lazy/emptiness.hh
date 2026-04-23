@@ -12,14 +12,14 @@
 namespace mata::nft::lazy::detail {
 
 /**
- * @brief Check emptiness of a reconstructed lazy symbolic relation tree.
- * @param tree Source symbolic tree storage.
+ * @brief Lazily decide emptiness of the symbolic formula rooted at @p root_node.
+ * @param formula Symbolic formula DAG containing the operators and leaves.
  * @param root_node Root symbolic term to evaluate.
- * @param level_alphabets Optional explicit root-level visible alphabets.
+ * @param level_alphabets Optional explicit per-level alphabets for the root relation.
  * @return `true` when the relation is empty, `false` otherwise.
  */
 bool is_empty(
-        const SymbolicAutomataTree& tree, const Term& root_node,
+        const SymbolicFormula& formula, const Term& root_node,
         const std::vector<mata::OnTheFlyAlphabet>* level_alphabets = nullptr);
 
 } // namespace mata::nft::lazy::detail

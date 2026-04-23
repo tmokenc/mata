@@ -11,9 +11,9 @@
 #include "reconstruction.hh"
 #include "subsumption.hh"
 
+#include <algorithm>
 #include <cstdint>
-#include <optional>
-#include <stdexcept>
+#include <memory>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -21,31 +21,30 @@
 namespace mata::nft::lazy::detail {
 
 namespace {
-    constexpr bool should_cache_transitions(const ExecKind kind) noexcept {
+    // Only product-like nodes do non-trivial work that can be repeated: their iterators get
+    // re-created for the same (node, state) pair across the search.  Leaves, Union, Identity, and
+    // Project just forward or relabel — caching them would cost more than it saves.
+    constexpr bool should_cache_transitions(const NodeKind kind) noexcept {
         switch (kind) {
-            case ExecKind::Intersect:
-            case ExecKind::SyncProduct:
-            case ExecKind::Complement:
-            case ExecKind::Arity1Intersect:
-            case ExecKind::Arity1Complement:
-            case ExecKind::Arity2Intersect:
-            case ExecKind::Arity2Complement:
-            case ExecKind::Arity2SyncProduct:
+            case NodeKind::Intersect:
+            case NodeKind::SyncProduct:
+            case NodeKind::Complement:
                 return true;
 
-            case ExecKind::LeafNfa:
-            case ExecKind::LeafNft:
-            case ExecKind::Union:
-            case ExecKind::Identity:
-            case ExecKind::Project:
-            case ExecKind::Arity1Union:
-            case ExecKind::Arity2LeafNft:
-            case ExecKind::Arity2Union:
-            case ExecKind::Arity2Project:
+            case NodeKind::LeafNfa:
+            case NodeKind::LeafNft:
+            case NodeKind::Union:
+            case NodeKind::Identity:
+            case NodeKind::Project:
                 return false;
         }
         return false;
     }
+
+    struct CacheEntry {
+        std::vector<GeneratedTransition> transitions{};
+        bool complete{false};
+    };
 
     struct TransitionCache {
         using Key = std::pair<NodeId, MacroStateId>;
@@ -57,23 +56,57 @@ namespace {
             }
         };
 
-        std::unordered_map<Key, std::vector<GeneratedTransition>, KeyHash> cache{};
+        // unique_ptr entries keep CacheEntry addresses stable across map rehashing,
+        // so WriteThroughIterator can safely hold a reference into the entry.
+        std::unordered_map<Key, std::unique_ptr<CacheEntry>, KeyHash> cache{};
 
-        const std::vector<GeneratedTransition>* get(const NodeId node_id, const MacroStateId state) const {
+        CacheEntry* get(const NodeId node_id, const MacroStateId state) {
             const auto it = cache.find(Key{node_id, state});
-            return it == cache.end() ? nullptr : &it->second;
+            return it == cache.end() ? nullptr : it->second.get();
         }
 
-        const std::vector<GeneratedTransition>&
-        set(const NodeId node_id, const MacroStateId state, std::vector<GeneratedTransition> transitions) {
-            const auto [it, _] = cache.emplace(Key{node_id, state}, std::move(transitions));
-            return it->second;
+        CacheEntry& get_or_create(const NodeId node_id, const MacroStateId state) {
+            auto& ptr = cache[Key{node_id, state}];
+            if (!ptr) {
+                ptr = std::make_unique<CacheEntry>();
+            }
+            return *ptr;
         }
+    };
+
+    // Lazily fills a CacheEntry one item at a time as the caller consumes transitions.
+    // This avoids full materialization when the caller exits early (e.g. accepting state found).
+    class WriteThroughIterator final : public TransitionIterator {
+    public:
+        WriteThroughIterator(IteratorContext& context, TransitionIteratorPtr live, CacheEntry& cache_entry)
+            : TransitionIterator{context}, live_iter{std::move(live)}, entry{cache_entry} {}
+
+        const GeneratedTransition* next() override {
+            const GeneratedTransition* item = live_iter->next();
+            if (!item) {
+                entry.complete = true;
+                return nullptr;
+            }
+            current = *item;
+            entry.transitions.push_back(current);
+            return &current;
+        }
+
+    private:
+        TransitionIteratorPtr live_iter;
+        CacheEntry& entry;
+        GeneratedTransition current{};
     };
 
     std::vector<CompiledSyncPlan> compile_sync_plans(const std::vector<SyncPlan>& sync_plans) {
         std::vector<CompiledSyncPlan> compiled_plans{};
         compiled_plans.reserve(sync_plans.size());
+
+        const auto level_count = [](const auto& levels) -> size_t {
+            if (levels.empty())
+                return 0;
+            return static_cast<size_t>(*std::max_element(levels.begin(), levels.end())) + 1;
+        };
 
         for (const SyncPlan& plan : sync_plans) {
             CompiledSyncPlan compiled{};
@@ -81,25 +114,8 @@ namespace {
             compiled.rhs_sync_levels = plan.rhs_sync_levels;
             compiled.result_layout = plan.result_layout;
 
-            const uint8_t lhs_levels = [&]() -> uint8_t {
-                uint8_t max_level = 0;
-                for (const uint8_t level : compiled.lhs_sync_levels) {
-                    if (level > max_level) {
-                        max_level = level;
-                    }
-                }
-                return compiled.lhs_sync_levels.empty() ? 0 : static_cast<uint8_t>(max_level + 1);
-            }();
-
-            const uint8_t rhs_levels = [&]() -> uint8_t {
-                uint8_t max_level = 0;
-                for (const uint8_t level : compiled.rhs_sync_levels) {
-                    if (level > max_level) {
-                        max_level = level;
-                    }
-                }
-                return compiled.rhs_sync_levels.empty() ? 0 : static_cast<uint8_t>(max_level + 1);
-            }();
+            const size_t lhs_levels = level_count(compiled.lhs_sync_levels);
+            const size_t rhs_levels = level_count(compiled.rhs_sync_levels);
 
             compiled.lhs_sync_peer_by_level.assign(lhs_levels, -1);
             compiled.rhs_sync_peer_by_level.assign(rhs_levels, -1);
@@ -124,49 +140,49 @@ namespace {
 
         std::vector<ExecNode> nodes;
         std::vector<CompiledSyncPlan> sync_plans;
-        MacroStateStore macro_store;
+        MacroStateStore macro_store_;
         AlphabetStore alphabets;
         SubsumptionEngine subsumption;
         TransitionTupleHelper transition_tuple_helper;
-        std::vector<std::vector<std::vector<mata::Symbol>>> complement_level_symbols_by_node;
         TransitionCache transition_cache;
         NodeId root_id;
 
-        Context(const SymbolicAutomataTree& tree, NodeId root,
+        Context(const SymbolicFormula& formula, NodeId root,
                 const std::vector<mata::OnTheFlyAlphabet>* root_level_alphabets = nullptr)
-            : nfas(tree.nfas), nfts(tree.nfts), project_plans(tree.project_plans), nodes{},
-              sync_plans{compile_sync_plans(tree.sync_plans)}, macro_store{}, alphabets{},
-              subsumption{SubsumptionContext{nfas, nfts, nodes, macro_store}},
-              transition_tuple_helper{nodes, alphabets}, complement_level_symbols_by_node{}, transition_cache{},
-              root_id{0} {
+            : nfas(formula.nfas), nfts(formula.nfts), project_plans(formula.project_plans), nodes{},
+              sync_plans{compile_sync_plans(formula.sync_plans)}, macro_store_{}, alphabets{},
+              subsumption{SubsumptionContext{nfas, nfts, nodes, macro_store_}},
+              transition_tuple_helper{nodes, alphabets}, transition_cache{}, root_id{0} {
 
-            root_id = reconstruct_nodes(tree, root, nodes);
-            macro_store = MacroStateStore(nodes, nfas, nfts);
-            alphabets = AlphabetStore{nodes, root_id, nfas, nfts, tree.sync_plans, project_plans, root_level_alphabets};
+            root_id = reconstruct_nodes(formula, root, nodes);
+            macro_store_ = MacroStateStore(nodes, nfas, nfts);
+            alphabets =
+                    AlphabetStore{nodes, root_id, nfas, nfts, formula.sync_plans, project_plans, root_level_alphabets};
             subsumption.initialize_leaf_simulations(root_id);
-            initialize_complement_level_symbols();
         }
 
-        MacroStateStore& macro_store_ref() override { return macro_store; }
+        MacroStateStore& macro_store() override { return macro_store_; }
 
         TransitionIteratorPtr make_transition_iterator(const NodeId node_id, const MacroStateId state) override {
-            if (!should_cache_transitions(nodes[node_id].kind)) {
+            // Root-node states are visited at most once (the `visited` set in is_empty guarantees
+            // this), so any cache entry for root would be permanently unreachable — skip it.
+            if (!should_cache_transitions(nodes[node_id].kind) || node_id == root_id) {
                 return make_uncached_transition_iterator(node_id, state);
             }
 
-            if (const std::vector<GeneratedTransition>* cached = transition_cache.get(node_id, state)) {
-                return make_buffered_transition_iterator(*this, *cached);
+            if (CacheEntry* existing = transition_cache.get(node_id, state)) {
+                if (existing->complete) {
+                    return std::make_unique<BufferedTransitionIterator>(*this, existing->transitions);
+                }
+                // Partial entry from a previous early-exit — clear and restart.
+                existing->transitions.clear();
+                return std::make_unique<WriteThroughIterator>(
+                        *this, make_uncached_transition_iterator(node_id, state), *existing);
             }
 
-            TransitionIteratorPtr uncached = make_uncached_transition_iterator(node_id, state);
-            std::vector<GeneratedTransition> materialized{};
-            while (const std::optional<GeneratedTransition> transition = uncached->next()) {
-                materialized.push_back(std::move(*transition));
-            }
-
-            const std::vector<GeneratedTransition>& cached =
-                    transition_cache.set(node_id, state, std::move(materialized));
-            return make_buffered_transition_iterator(*this, cached);
+            CacheEntry& entry = transition_cache.get_or_create(node_id, state);
+            return std::make_unique<WriteThroughIterator>(
+                    *this, make_uncached_transition_iterator(node_id, state), entry);
         }
 
     private:
@@ -174,96 +190,70 @@ namespace {
             const ExecNode& node = nodes[node_id];
 
             switch (node.kind) {
-                case ExecKind::LeafNfa:
-                    return make_leaf_nfa_transition_iterator(*this, nfas[node.lhs], alphabets, node_id, state);
+                case NodeKind::LeafNfa:
+                    return std::make_unique<LeafNfaTransitionIterator>(
+                            *this, nfas[node.lhs], alphabets, node_id, state);
 
-                case ExecKind::LeafNft:
-                case ExecKind::Arity2LeafNft:
-                    return make_leaf_nft_transition_iterator(
+                case NodeKind::LeafNft:
+                    return std::make_unique<LeafNftTransitionIterator>(
                             *this, nfts[node.lhs], alphabets, node_id, state, node.result_arity);
 
-                case ExecKind::Union:
-                case ExecKind::Arity1Union:
-                case ExecKind::Arity2Union: {
-                    const TaggedState tagged = macro_store.get_tagged(node_id, state);
+                case NodeKind::Union: {
+                    const TaggedState tagged = macro_store_.get_tagged(node_id, state);
                     const NodeId child_id = tagged.tag == TaggedState::Tag::Left ? node.lhs : node.rhs;
-                    return make_union_transition_iterator(
-                            *this, node_id, tagged.tag, make_transition_iterator(child_id, tagged.state));
+                    return make_mapped_transition_iterator(
+                            *this, make_transition_iterator(child_id, tagged.state),
+                            [node_id, tag = tagged.tag](IteratorContext& ctx, const GeneratedTransition& t) {
+                                return GeneratedTransition{
+                                        t.tuple,
+                                        GeneratedMacroState{
+                                                ctx.macro_store().intern(node_id, TaggedState{t.state.id, tag}),
+                                                t.state.accepting}};
+                            });
                 }
 
-                case ExecKind::Intersect:
-                case ExecKind::Arity1Intersect:
-                case ExecKind::Arity2Intersect: {
-                    const PairState pair = macro_store.get_pair(node_id, state);
-                    return make_intersect_transition_iterator(
+                case NodeKind::Intersect: {
+                    const PairState pair = macro_store_.get_pair(node_id, state);
+                    return std::make_unique<IntersectTransitionIterator>(
                             *this, transition_tuple_helper, node_id, node.lhs, pair.lhs, node.rhs, pair.rhs);
                 }
 
-                case ExecKind::SyncProduct:
-                case ExecKind::Arity2SyncProduct: {
-                    const PairState pair = macro_store.get_pair(node_id, state);
-                    return make_sync_product_transition_iterator(
+                case NodeKind::SyncProduct: {
+                    const PairState pair = macro_store_.get_pair(node_id, state);
+                    return std::make_unique<SyncProductTransitionIterator>(
                             *this, transition_tuple_helper, node_id, node.lhs, pair.lhs, node.rhs, pair.rhs,
                             sync_plans[node.payload]);
                 }
 
-                case ExecKind::Complement:
-                case ExecKind::Arity1Complement:
-                case ExecKind::Arity2Complement: {
-                    return make_complement_transition_iterator(
-                            *this, node_id, node.lhs, macro_store.get_set(node_id, state), subsumption,
-                            complement_level_symbols_by_node[node_id]);
-                }
+                case NodeKind::Complement:
+                    return std::make_unique<ComplementTransitionIterator>(
+                            *this, node_id, node.lhs, macro_store_.get_set(node_id, state), subsumption,
+                            alphabets.level_symbols(node_id));
 
-                case ExecKind::Identity:
-                    return make_identity_transition_iterator(*this, make_transition_iterator(node.lhs, state));
+                case NodeKind::Identity:
+                    return make_mapped_transition_iterator(
+                            *this, make_transition_iterator(node.lhs, state),
+                            [](IteratorContext&, const GeneratedTransition& t) {
+                                assert(t.tuple.size() == 1);
+                                return GeneratedTransition{SymbolTuple{t.tuple[0], t.tuple[0]}, t.state};
+                            });
 
-                case ExecKind::Project:
-                case ExecKind::Arity2Project:
-                    return make_project_transition_iterator(
-                            *this, project_plans[node.payload], make_transition_iterator(node.lhs, state));
-            }
-
-            throw std::logic_error("Unreachable transition reconstruction branch.");
-        }
-
-        void initialize_complement_level_symbols() {
-            complement_level_symbols_by_node.clear();
-            complement_level_symbols_by_node.resize(nodes.size());
-
-            for (NodeId node_id = 0; node_id < nodes.size(); ++node_id) {
-                const ExecNode& node = nodes[node_id];
-                switch (node.kind) {
-                    case ExecKind::Complement:
-                    case ExecKind::Arity1Complement:
-                    case ExecKind::Arity2Complement: {
-                        std::vector<std::vector<mata::Symbol>>& level_symbols =
-                                complement_level_symbols_by_node[node_id];
-                        level_symbols.resize(node.result_arity);
-                        for (uint8_t level = 0; level < node.result_arity; ++level) {
-                            level_symbols[level] =
-                                    alphabets.level_alphabet(node_id, level).get_alphabet_symbols().to_vector();
-                        }
-                        break;
-                    }
-
-                    case ExecKind::LeafNfa:
-                    case ExecKind::LeafNft:
-                    case ExecKind::Union:
-                    case ExecKind::Intersect:
-                    case ExecKind::Identity:
-                    case ExecKind::Project:
-                    case ExecKind::SyncProduct:
-                    case ExecKind::Arity1Union:
-                    case ExecKind::Arity1Intersect:
-                    case ExecKind::Arity2LeafNft:
-                    case ExecKind::Arity2Union:
-                    case ExecKind::Arity2Intersect:
-                    case ExecKind::Arity2Project:
-                    case ExecKind::Arity2SyncProduct:
-                        break;
+                case NodeKind::Project: {
+                    const ProjectPlan& plan = project_plans[node.payload];
+                    return make_mapped_transition_iterator(
+                            *this, make_transition_iterator(node.lhs, state),
+                            [&plan](IteratorContext&, const GeneratedTransition& t) {
+                                SymbolTuple projected{};
+                                projected.reserve(plan.kept_levels.size());
+                                for (const uint8_t level : plan.kept_levels) {
+                                    projected.push_back(t.tuple[level]);
+                                }
+                                return GeneratedTransition{std::move(projected), t.state};
+                            });
                 }
             }
+
+            unreachable_kind(node.kind, "transition iterator");
         }
 
     public:
@@ -271,53 +261,41 @@ namespace {
             const ExecNode& node = nodes[node_id];
 
             switch (node.kind) {
-                case ExecKind::LeafNfa:
-                    return make_leaf_nfa_initial_state_iterator(*this, nfas[node.lhs]);
+                case NodeKind::LeafNfa:
+                    return std::make_unique<LeafInitialStateIterator<Nfa>>(*this, nfas[node.lhs]);
 
-                case ExecKind::LeafNft:
-                case ExecKind::Arity2LeafNft:
-                    return make_leaf_nft_initial_state_iterator(*this, nfts[node.lhs]);
+                case NodeKind::LeafNft:
+                    return std::make_unique<LeafInitialStateIterator<Nft>>(*this, nfts[node.lhs]);
 
-                case ExecKind::Union:
-                case ExecKind::Arity1Union:
-                case ExecKind::Arity2Union: {
-                    return make_union_initial_state_iterator(
+                case NodeKind::Union:
+                    return std::make_unique<UnionInitialStateIterator>(
                             *this, node_id, make_initial_state_iterator(node.lhs),
                             make_initial_state_iterator(node.rhs));
-                }
 
-                case ExecKind::Intersect:
-                case ExecKind::SyncProduct:
-                case ExecKind::Arity1Intersect:
-                case ExecKind::Arity2Intersect:
-                case ExecKind::Arity2SyncProduct: {
-                    return make_product_initial_state_iterator(
+                case NodeKind::Intersect:
+                case NodeKind::SyncProduct:
+                    return std::make_unique<ProductInitialStateIterator>(
                             *this, node_id, node.rhs, make_initial_state_iterator(node.lhs));
-                }
 
-                case ExecKind::Complement:
-                case ExecKind::Arity1Complement:
-                case ExecKind::Arity2Complement: {
-                    return make_complement_initial_state_iterator(
+                case NodeKind::Complement:
+                    return std::make_unique<ComplementInitialStateIterator>(
                             *this, node_id, node.lhs, make_initial_state_iterator(node.lhs), subsumption);
-                }
 
-                case ExecKind::Identity:
-                case ExecKind::Project:
-                case ExecKind::Arity2Project:
-                    return make_passthrough_initial_state_iterator(*this, make_initial_state_iterator(node.lhs));
+                case NodeKind::Identity:
+                case NodeKind::Project:
+                    return make_initial_state_iterator(node.lhs);
             }
 
-            throw std::logic_error("Unreachable initial-state reconstruction branch.");
+            unreachable_kind(node.kind, "initial-state iterator");
         }
     };
 
 } // namespace
 
 bool is_empty(
-        const SymbolicAutomataTree& tree, const Term& root_node,
+        const SymbolicFormula& formula, const Term& root_node,
         const std::vector<mata::OnTheFlyAlphabet>* level_alphabets) {
-    Context ctx(tree, root_node.get_id(), level_alphabets);
+    Context ctx(formula, root_node.get_id(), level_alphabets);
 
     std::vector<MacroStateId> worklist{};
     std::unordered_set<MacroStateId> visited{};
@@ -338,7 +316,7 @@ bool is_empty(
 
     InitialStateIteratorPtr initial_states = ctx.make_initial_state_iterator(ctx.root_id);
 
-    while (const std::optional<GeneratedMacroState> initial_state = initial_states->next()) {
+    while (const GeneratedMacroState* initial_state = initial_states->next()) {
         if (initial_state->accepting) {
             return false;
         }
@@ -355,7 +333,7 @@ bool is_empty(
         }
 
         TransitionIteratorPtr transitions = ctx.make_transition_iterator(ctx.root_id, current_state);
-        while (const std::optional<GeneratedTransition> transition = transitions->next()) {
+        while (const GeneratedTransition* transition = transitions->next()) {
             if (transition->state.accepting) {
                 return false;
             }
@@ -364,6 +342,7 @@ bool is_empty(
         }
     }
 
+    // Exhausted the reachable state space without hitting an accepting state.
     return true;
 }
 

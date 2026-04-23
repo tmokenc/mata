@@ -25,18 +25,18 @@ nfa::Nfa single_symbol_nfa(Symbol symbol) {
 } // namespace
 
 TEST_CASE("mata::nfa::lazy exposes the NFA-only boolean fragment") {
-    nfa::lazy::SymbolicAutomataTree tree;
+    nfa::lazy::SymbolicFormula tree;
 
     const nfa::lazy::Term a = tree.make_term(single_symbol_nfa('a'));
     const nfa::lazy::Term b = tree.make_term(single_symbol_nfa('b'));
-    const nfa::lazy::Term union_term = tree.union_(a, b);
+    const nfa::lazy::Term union_term = tree.unite(a, b);
 
     CHECK(tree.is_valid(union_term));
     CHECK_FALSE(tree.is_empty(union_term));
 }
 
 TEST_CASE("mata::nfa::lazy keeps complement available but hides NFT-only operators") {
-    nfa::lazy::SymbolicAutomataTree tree;
+    nfa::lazy::SymbolicFormula tree;
 
     const nfa::lazy::Term a = tree.make_term(single_symbol_nfa('a'));
     const nfa::lazy::Term not_a = tree.complement(a);

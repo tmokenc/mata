@@ -1,5 +1,18 @@
 /** @file lazy.hh
  * @brief Lazy on-the-fly emptiness checking for symbolic combinations of arbitrary-arity relations.
+ *
+ * The public interface centres on two types:
+ *
+ *   - @c Term   — an opaque handle to one node inside a @c SymbolicFormula DAG.
+ *   - @c SymbolicFormula — a directed acyclic graph (DAG) of symbolic operators
+ *     (@c unite, @c intersect, @c complement, @c compose, @c post_image, …) over
+ *     NFA and NFT leaves.  Nodes are added incrementally; because terms are just
+ *     integer handles, the same sub-formula can be referenced by multiple parents
+ *     without duplication, making the structure a DAG rather than a tree.
+ *
+ * Evaluation is entirely lazy: building the DAG performs no automata operations.
+ * Work begins only when @c SymbolicFormula::is_empty is called, and only the
+ * macrostates actually needed to decide emptiness are ever materialised.
  */
 
 #ifndef MATA_NFT_LAZY_HH
@@ -14,7 +27,7 @@
 
 namespace mata::nft::lazy {
 
-/// Identifier of a node in the symbolic relation tree.
+/// Identifier of a node in the symbolic formula DAG.
 using NodeId = uint32_t;
 /// Identifier of a lazily constructed macrostate.
 using MacroStateId = uint32_t;
@@ -22,7 +35,7 @@ using MacroStateId = uint32_t;
 constexpr uint32_t NO_PAYLOAD = std::numeric_limits<uint32_t>::max();
 
 
-/// Opaque handle to a node in the symbolic relation tree.
+/// Opaque handle to a node in the symbolic formula DAG.
 class Term {
     NodeId id;
 
@@ -91,8 +104,8 @@ struct Node {
     uint32_t payload;
 };
 
-/// Builder and query interface for lazy symbolic relation trees.
-class SymbolicAutomataTree {
+/// DAG of symbolic relation operators evaluated lazily for emptiness checking.
+class SymbolicFormula {
     NodeId insert_leaf(NodeKind kind, NodeId leaf_id, uint8_t result_arity);
     NodeId insert_unary(NodeKind kind, NodeId child, uint8_t result_arity, uint32_t payload = NO_PAYLOAD);
     NodeId insert_binary(NodeKind kind, NodeId lhs, NodeId rhs, uint8_t result_arity, uint32_t payload = NO_PAYLOAD);
@@ -104,15 +117,14 @@ public:
     std::vector<nfa::Nfa> nfas;
     /// Owned NFT leaves referenced by leaf nodes.
     std::vector<nft::Nft> nfts;
-    /// Symbolic tree nodes.
+    /// DAG nodes, one per symbolic operator or leaf.
     std::vector<Node> nodes;
     /// Synchronization plans used by sync-product nodes.
     std::vector<SyncPlan> sync_plans;
     /// Projection plans used by project nodes.
     std::vector<ProjectPlan> project_plans;
 
-    /// Create an empty symbolic tree.
-    SymbolicAutomataTree() : nfas{}, nfts{}, nodes{}, sync_plans{}, project_plans{} {}
+    SymbolicFormula() : nfas{}, nfts{}, nodes{}, sync_plans{}, project_plans{} {}
 
     /**
      * Insert a concrete NFA leaf.
@@ -132,8 +144,10 @@ public:
      * @param lhs Left operand.
      * @param rhs Right operand.
      * @return Symbolic term for `lhs ∪ rhs`.
+     *
+     * @note the union is a keyword in C++, so the method is named `unite` instead of `union`.
      */
-    Term union_(const Term& lhs, const Term& rhs);
+    Term unite(const Term& lhs, const Term& rhs);
     /**
      * Intersection of two equal-arity relations.
      * @param lhs Left operand.
@@ -228,7 +242,7 @@ public:
     uint8_t arity_of(const Term& term) const;
 
     /**
-     * Check that @p root_node refers to a valid node in this tree.
+     * Check that @p root_node refers to a valid node in this DAG.
      * @param root_node Symbolic term handle to validate.
      * @return `true` if the handle refers to a structurally valid reachable node.
      */

@@ -9,6 +9,7 @@
 
 #include "mata/utils/two-dimensional-map.hh"
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -26,7 +27,10 @@ struct MacroStateStore {
     using SetStore = std::unordered_map<MacroStateId, SetState>;
     /// Sparse storage used for union tag states.
     using TaggedStore = std::unordered_map<MacroStateId, TaggedState>;
-    /// Upper bound for enabling the dense pair-store matrix optimization.
+    /// Maximum total elements (lhs_states × rhs_states) for the dense pair-store matrix to be feasible.
+    /// This is a tunable heuristic: smaller values save memory at the cost of more hashing, while larger
+    /// values allow faster lookups for larger state spaces at the cost of more memory usage.
+    /// TODO: Maybe make this configurable at runtime and/or adapt it dynamically based on observed state counts.
     static constexpr size_t DENSE_PAIR_MAX_MATRIX_SIZE = 10'000'000;
 
     /// Return whether a dense matrix pair store is feasible for the given bounds.
@@ -70,12 +74,19 @@ struct MacroStateStore {
             const std::vector<ExecNode>& nodes, const std::vector<mata::nfa::Nfa>& nfas,
             const std::vector<mata::nft::Nft>& nfts);
 
-    /// Lookup an interned pair state.
-    PairState get_pair(NodeId idx, MacroStateId id) const;
-    /// Lookup an interned subset state.
-    const SetState& get_set(NodeId idx, MacroStateId id) const;
-    /// Lookup an interned tagged state.
-    TaggedState get_tagged(NodeId idx, MacroStateId id) const;
+    PairState get_pair(NodeId idx, MacroStateId id) const { return pair_stores[node_to_store_index[idx]].get(id); }
+
+    const SetState& get_set(NodeId idx, MacroStateId id) const {
+        const auto it = set_stores[node_to_store_index[idx]].find(id);
+        assert(it != set_stores[node_to_store_index[idx]].end());
+        return it->second;
+    }
+
+    TaggedState get_tagged(NodeId idx, MacroStateId id) const {
+        const auto it = tagged_stores[node_to_store_index[idx]].find(id);
+        assert(it != tagged_stores[node_to_store_index[idx]].end());
+        return it->second;
+    }
 
     /// Intern a subset state for one exec node.
     MacroStateId intern(const NodeId idx, SetState states);

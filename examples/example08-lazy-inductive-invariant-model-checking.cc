@@ -108,7 +108,7 @@ int main() {
     // `v` goes from Gamma to Sigma.
     Nft v = single_symbol_relation({{gamma_a, sigma_0}, {gamma_b, sigma_1}}, {&gamma, &sigma});
 
-    SymbolicAutomataTree tree;
+    SymbolicFormula tree;
 
     const Term t_initial = tree.make_term(initial);
     const Term t_unsafe = tree.make_term(unsafe);

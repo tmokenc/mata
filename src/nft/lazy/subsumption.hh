@@ -11,7 +11,6 @@
 #include <mata/simlib/explicit_lts.hh>
 
 #include <cstdint>
-#include <map>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -36,48 +35,91 @@ struct SubsumptionContext {
 
 /**
  * @brief Cache for previously computed subsumption results between pairs of macro states.
+ *
+ * Uses a flat open-addressing hash table with linear probing for cache locality.
+ * The sentinel value ~uint64_t{0} is assumed never to be a valid packed key; in practice
+ * macro-state IDs never reach 2^32-1 during any reachable emptiness search.
+ *
+ * When update the MacroStateId values to uint64_t, we can remove the packing and directly use the pair of IDs as the
+ * key.
  */
 struct SubsumptionCache {
-    /**
-     * @brief Hash for pairs of macro-state identifiers.
-     */
-    struct KeyHash {
-        /**
-         * @brief Hash one pair of macro-state identifiers.
-         * @param key Pair of macro-state identifiers.
-         * @return Hash value for @p key.
-         */
-        size_t operator()(const std::pair<MacroStateId, MacroStateId>& key) const noexcept {
-            return static_cast<size_t>(
-                    mix_hash64((static_cast<uint64_t>(key.first) << 32) | static_cast<uint64_t>(key.second)));
+    SubsumptionCache() : table(kInitialCapacity), count(0), true_count(0) {}
+
+    std::optional<bool> get(const MacroStateId s1, const MacroStateId s2) const {
+        const uint64_t k = pack(s1, s2);
+        size_t idx = slot(k);
+
+        while (true) {
+            const Entry& e = table[idx];
+
+            if (e.key == kEmpty) {
+                return std::nullopt;
+            }
+            if (e.key == k) {
+                return e.value;
+            }
+
+            idx = (idx + 1) & mask();
         }
+    }
+
+    void set(const MacroStateId s1, const MacroStateId s2, const bool result) {
+        if ((count + 1) * 2 >= table.size()) {
+            rehash();
+        }
+
+        insert_into(table, pack(s1, s2), result);
+        ++count;
+
+        if (result) {
+            ++true_count;
+        }
+    }
+
+    size_t size() const { return count; }
+    size_t count_true() const { return true_count; }
+
+private:
+    struct Entry {
+        uint64_t key{kEmpty};
+        bool value{false};
     };
 
-    /// Stored cache entries.
-    std::unordered_map<std::pair<MacroStateId, MacroStateId>, bool, KeyHash> cache;
+    static constexpr uint64_t kEmpty = ~uint64_t{0};
+    static constexpr size_t kInitialCapacity = 16;
 
-    /**
-     * @brief Construct an empty subsumption cache.
-     */
-    SubsumptionCache() : cache{} {}
+    std::vector<Entry> table;
+    size_t count;
+    size_t true_count;
 
-    /**
-     * @brief Get a cached subsumption result if present.
-     *
-     * @param state1 First macro state.
-     * @param state2 Second macro state.
-     * @return Cached result, or @c std::nullopt if missing.
-     */
-    std::optional<bool> get(MacroStateId state1, MacroStateId state2) const;
+    // Capacity is always a power of two (kInitialCapacity, doubled on rehash), so mask = size - 1.
+    size_t mask() const { return table.size() - 1; }
 
-    /**
-     * @brief Store a subsumption result in the cache.
-     *
-     * @param state1 First macro state.
-     * @param state2 Second macro state.
-     * @param result Cached subsumption result.
-     */
-    void set(MacroStateId state1, MacroStateId state2, bool result);
+    static uint64_t pack(const MacroStateId s1, const MacroStateId s2) {
+        return (static_cast<uint64_t>(s1) << 32) | static_cast<uint64_t>(s2);
+    }
+
+    size_t slot(const uint64_t k) const { return static_cast<size_t>(fold_hash64(mix_hash64(k))) & mask(); }
+
+    static void insert_into(std::vector<Entry>& tbl, const uint64_t k, const bool val) {
+        const size_t msk = tbl.size() - 1;
+        size_t idx = static_cast<size_t>(fold_hash64(mix_hash64(k))) & msk;
+        while (tbl[idx].key != kEmpty) {
+            idx = (idx + 1) & msk;
+        }
+        tbl[idx] = {k, val};
+    }
+
+    void rehash() {
+        std::vector<Entry> new_table(table.size() * 2);
+        for (const Entry& e : table) {
+            if (e.key != kEmpty) {
+                insert_into(new_table, e.key, e.value);
+            }
+        }
+        table = std::move(new_table);
+    }
 };
 
 /**
@@ -100,22 +142,6 @@ public:
     void initialize_leaf_simulations(NodeId root_id);
 
     /**
-     * @brief Store the precomputed simulation relation of one NFA leaf.
-     *
-     * @param nfa_index Index of the NFA leaf.
-     * @param relation Precomputed simulation relation.
-     */
-    void set_nfa_simulation(size_t nfa_index, Simlib::Util::BinaryRelation relation);
-
-    /**
-     * @brief Store the precomputed simulation relation of one NFT leaf.
-     *
-     * @param nft_index Index of the NFT leaf.
-     * @param relation Precomputed simulation relation.
-     */
-    void set_nft_simulation(size_t nft_index, Simlib::Util::BinaryRelation relation);
-
-    /**
      * @brief Check whether @p state is subsumed.
      *
      * Updates antichains by removing weaker states.
@@ -127,13 +153,13 @@ public:
     bool is_subsumed(NodeId root_id, MacroStateId state);
 
     /**
-     * @brief Minimize the @p state by removing all subsumed states from it, acocording to
-     * the Optimization 2 described in the paper Simulation meets antichains.
+     * @brief Minimize @p state by removing all internally subsumed elements.
      *
-     * This function do a fixed-point iteration to remove all subsumed states from @p state
+     * Applies a fixed-point iteration to remove states dominated by other states
+     * within the same set (Optimization 2 from "Simulation meets antichains").
      *
-     * @param root_id The root node of the macro state.
-     * @param state The state to minimize. It will be modified in-place.
+     * @param root_id Root node of the macro state.
+     * @param state Set state to minimize in-place.
      */
     void minimize(NodeId root_id, SetState& state);
 
@@ -149,32 +175,30 @@ public:
     bool is_pruned(MacroStateId state) const;
 
     /**
-     * @brief Print statistics about the current subsumption engine state, size of the antichain, ratio between true and
-     * false subsumption results. Result for local caches and global
-     *
-     **/
+     * @brief Print subsumption statistics to stdout: antichain size and per-node cache hit ratios.
+     */
     void print_statistics() const;
 
 private:
     using State = mata::nfa::State;
 
-    /// External NFA references.
-    const std::vector<mata::nfa::Nfa>& nfas;
-    /// External NFT references.
-    const std::vector<mata::nft::Nft>& nfts;
-    /// Execution DAG nodes.
-    const std::vector<ExecNode>& nodes;
-    /// Shared macro-state storage.
-    const MacroStateStore& macro_store;
+    /// External references.
+    const SubsumptionContext context;
 
     /// Precomputed simulation relations for NFA leaves.
     std::vector<Simlib::Util::BinaryRelation> precomputed_simulation_nfas;
     /// Precomputed simulation relations for NFT leaves.
     std::vector<Simlib::Util::BinaryRelation> precomputed_simulation_nfts;
+    /// One bucket: (fingerprint value, list of antichain entries with that fingerprint).
+    using InnerBucket = std::pair<uint32_t, std::vector<MacroStateId>>;
+    /// Sorted-by-fingerprint vector of buckets, enabling range queries by fingerprint value.
+    using InnerBuckets = std::vector<InnerBucket>;
+    using BucketsRange = std::pair<InnerBuckets::iterator, InnerBuckets::iterator>;
+
     /// Current antichain of non-subsumed states (flat view used by is_pruned).
     std::unordered_set<MacroStateId> antichain;
-    /// Antichain bucketed by structural fingerprint to prune incompatible candidates early.
-    std::map<uint32_t, std::vector<MacroStateId>> antichain_buckets;
+    /// Antichain: outer key = lhs macrostate (IntersectRhsSetSize) or 0; inner key = fingerprint.
+    std::unordered_map<MacroStateId, InnerBuckets> buckets;
     /// Per-node subsumption caches.
     std::vector<SubsumptionCache> caches;
 
@@ -188,11 +212,11 @@ private:
     enum class AntichainFilterKind : uint8_t {
         /// No structural filter — fall back to scanning every entry.
         None = 0,
-        /// Root is Union*: fingerprint = TaggedState::Tag (subsumption requires equal tag).
+        /// Root is Union: fingerprint = TaggedState::Tag (subsumption requires equal tag).
         Tag,
-        /// Root is Complement*: fingerprint = |SetState| (subsumption reverses subset order).
+        /// Root is Complement: fingerprint = |SetState| (subsumption reverses subset order).
         RootSetSize,
-        /// Root is Intersect*/SyncProduct* with a Complement rhs:
+        /// Root is Intersect/SyncProduct with a Complement rhs:
         /// fingerprint = |SetState of pair.rhs|.
         IntersectRhsSetSize,
     };
@@ -203,6 +227,13 @@ private:
     NodeId filter_fingerprint_source_node = 0;
     /// Root exec node used when computing fingerprints.
     NodeId filter_root_node = 0;
+
+    /// NFA leaf index for the LHS child when root is Intersect(LeafNfa, Complement(…)).
+    std::optional<size_t> filter_lhs_nfa_index{};
+    /// Per-NFA-A-state forward simulation neighbors: lhs_fwd_sim_neighbors[q] = {q' : q ≤_sim q'}.
+    std::vector<std::vector<MacroStateId>> lhs_fwd_sim_neighbors{};
+    /// Per-NFA-A-state backward simulation neighbors: lhs_bwd_sim_neighbors[q] = {q' : q' ≤_sim q}.
+    std::vector<std::vector<MacroStateId>> lhs_bwd_sim_neighbors{};
 
     /**
      * @brief Recursive worker for reachable-leaf simulation initialization.
@@ -228,11 +259,42 @@ private:
     /// Compute the structural fingerprint of @p state under the current filter.
     uint32_t compute_fingerprint(MacroStateId state) const;
 
-    /// Return true if @p entry_fp could belong to an antichain entry that subsumes a query of fingerprint @p state_fp.
-    bool fingerprint_can_subsume(uint32_t entry_fp, uint32_t state_fp) const noexcept;
+    /// Select or create the inner bucket map for @p state given the current filter kind.
+    InnerBuckets& inner_bucket(MacroStateId state);
 
-    /// Return true if @p entry_fp could belong to an antichain entry that is subsumed by a query of fingerprint @p state_fp.
-    bool fingerprint_can_be_subsumed(uint32_t entry_fp, uint32_t state_fp) const noexcept;
+    /// Returns the range of inner bucket entries that could subsume @p state.
+    BucketsRange check_range(InnerBuckets& inner, uint32_t fp) const;
+
+    /// Returns the range of inner bucket entries that @p state could make redundant.
+    BucketsRange remove_range(InnerBuckets& inner, uint32_t fp) const;
+
+    /// Find or insert the entry for @p key in a sorted InnerBuckets vector, returning its state list.
+    static std::vector<MacroStateId>& get_or_insert_bucket(InnerBuckets& inner, uint32_t key);
+
+    /**
+     * @brief Precompute per-NFA-state simulation neighbor lists for the LHS leaf.
+     *
+     * Called only when @c filter_kind is @c IntersectRhsSetSize and the root Intersect
+     * node's LHS child is a @c LeafNfa.  After this call:
+     *
+     * - @c lhs_fwd_sim_neighbors[q] = { q' : q ≤_sim q' }
+     *   Forward neighbors used in the *check* phase: antichain entries whose LHS
+     *   simulates @c q may subsume the query state.
+     *
+     * - @c lhs_bwd_sim_neighbors[q] = { q' : q' ≤_sim q }
+     *   Backward neighbors used in the *remove* phase: antichain entries whose LHS
+     *   is simulated by @c q can be subsumed by the query state.
+     */
+    void build_lhs_sim_neighbors();
+
+    /**
+     * @brief Simulation-aware fast path of @c is_subsumed for the @c IntersectRhsSetSize filter.
+     *
+     * Called when @c lhs_fwd_sim_neighbors is populated.  Scans all outer buckets
+     * reachable via the precomputed simulation neighbors instead of only the bucket
+     * matching the exact @c pair.lhs.
+     */
+    bool is_subsumed_with_lhs_sim(NodeId root_id, MacroStateId state, uint32_t fp);
 };
 
 } // namespace mata::nft::lazy::detail

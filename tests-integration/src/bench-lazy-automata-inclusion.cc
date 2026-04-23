@@ -61,7 +61,7 @@ int main(int argc, char* argv[]) {
     bool antichains = mata::nfa::is_included(lhs, rhs, &alphabet, params);
     TIME_END(automata_inclusion_antichain);
 
-    mata::nft::lazy::SymbolicAutomataTree tree;
+    mata::nft::lazy::SymbolicFormula tree;
 
     auto term_lhs = tree.make_term(lhs);
     auto term_rhs = tree.make_term(rhs);
