@@ -30,8 +30,12 @@ struct MacroStateStore {
     /// Maximum total elements (lhs_states × rhs_states) for the dense pair-store matrix to be feasible.
     /// This is a tunable heuristic: smaller values save memory at the cost of more hashing, while larger
     /// values allow faster lookups for larger state spaces at the cost of more memory usage.
+    /// At MacroStateId = uint32_t (4 bytes per cell) the cap is the per-pair-store upper bound on dense
+    /// matrix memory, so 1M cells = 4 MB ceiling. The matrix is allocated up front for every product-like
+    /// node whose bounds fit, so a generous cap pays for itself only when the search actually visits a
+    /// large fraction of (lhs, rhs) combinations.
     /// TODO: Maybe make this configurable at runtime and/or adapt it dynamically based on observed state counts.
-    static constexpr size_t DENSE_PAIR_MAX_MATRIX_SIZE = 10'000'000;
+    static constexpr size_t DENSE_PAIR_MAX_MATRIX_SIZE = 1'000'000;
 
     /// Return whether a dense matrix pair store is feasible for the given bounds.
     static bool can_use_dense_pair_store(std::optional<size_t> lhs_bound, std::optional<size_t> rhs_bound);

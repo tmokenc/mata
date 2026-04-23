@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <unordered_set>
 #include <utility>
@@ -42,13 +43,9 @@ namespace {
         return false;
     }
 
-    struct CacheEntry {
-        std::vector<GeneratedTransition> transitions{};
-        bool complete{false};
-    };
-
     struct TransitionCache {
         using Key = std::pair<NodeId, MacroStateId>;
+        using Buffer = std::vector<GeneratedTransition>;
 
         struct KeyHash {
             size_t operator()(const Key& key) const noexcept {
@@ -57,46 +54,62 @@ namespace {
             }
         };
 
-        // unique_ptr entries keep CacheEntry addresses stable across map rehashing,
-        // so WriteThroughIterator can safely hold a reference into the entry.
-        std::unordered_map<Key, std::unique_ptr<CacheEntry>, KeyHash> cache{};
+        // Only fully enumerated transition lists live in the cache. Storage is a deque of buffers so
+        // pointers into the buffers stay valid across later commits (deque guarantees stable refs on
+        // push_back), letting BufferedTransitionIterator hold a const-ref into the buffer.
+        std::deque<Buffer> buffers{};
+        std::unordered_map<Key, Buffer*, KeyHash> index{};
 
-        CacheEntry* get(const NodeId node_id, const MacroStateId state) {
-            const auto it = cache.find(Key{node_id, state});
-            return it == cache.end() ? nullptr : it->second.get();
+        const Buffer* get(const NodeId node_id, const MacroStateId state) const {
+            const auto it = index.find(Key{node_id, state});
+            return it == index.end() ? nullptr : it->second;
         }
 
-        CacheEntry& get_or_create(const NodeId node_id, const MacroStateId state) {
-            auto& ptr = cache[Key{node_id, state}];
-            if (!ptr) {
-                ptr = std::make_unique<CacheEntry>();
-            }
-            return *ptr;
+        void commit(const NodeId node_id, const MacroStateId state, Buffer buffer) {
+            buffers.emplace_back(std::move(buffer));
+            index.emplace(Key{node_id, state}, &buffers.back());
         }
     };
 
-    // Lazily fills a CacheEntry one item at a time as the caller consumes transitions.
-    // This avoids full materialization when the caller exits early (e.g. accepting state found).
+    // Buffers transitions in iterator-local memory and commits them to the cache on destruction
+    // only when the underlying iterator was exhausted. Abandoned (early-exit) iterations leave no
+    // trace in the cache, so the cache never holds partial replays.
     class WriteThroughIterator final : public TransitionIterator {
     public:
-        WriteThroughIterator(IteratorContext& context, TransitionIteratorPtr live, CacheEntry& cache_entry)
-            : TransitionIterator{context}, live_iter{std::move(live)}, entry{cache_entry} {}
+        WriteThroughIterator(
+                IteratorContext& context, TransitionIteratorPtr live, TransitionCache& cache,
+                const NodeId node_id, const MacroStateId state)
+            : TransitionIterator{context}, live_iter{std::move(live)}, target_cache{cache},
+              target_node_id{node_id}, target_state{state} {}
+
+        WriteThroughIterator(const WriteThroughIterator&) = delete;
+        WriteThroughIterator& operator=(const WriteThroughIterator&) = delete;
+
+        ~WriteThroughIterator() override {
+            if (completed) {
+                target_cache.commit(target_node_id, target_state, std::move(buffer));
+            }
+        }
 
         const GeneratedTransition* next() override {
             const GeneratedTransition* item = live_iter->next();
             if (!item) {
-                entry.complete = true;
+                completed = true;
                 return nullptr;
             }
             current = *item;
-            entry.transitions.push_back(current);
+            buffer.push_back(current);
             return &current;
         }
 
     private:
         TransitionIteratorPtr live_iter;
-        CacheEntry& entry;
+        TransitionCache& target_cache;
+        NodeId target_node_id;
+        MacroStateId target_state;
+        TransitionCache::Buffer buffer{};
         GeneratedTransition current{};
+        bool completed{false};
     };
 
     std::vector<CompiledSyncPlan> compile_sync_plans(const std::vector<SyncPlan>& sync_plans) {
@@ -171,19 +184,12 @@ namespace {
                 return make_uncached_transition_iterator(node_id, state);
             }
 
-            if (CacheEntry* existing = transition_cache.get(node_id, state)) {
-                if (existing->complete) {
-                    return std::make_unique<BufferedTransitionIterator>(*this, existing->transitions);
-                }
-                // Partial entry from a previous early-exit — clear and restart.
-                existing->transitions.clear();
-                return std::make_unique<WriteThroughIterator>(
-                        *this, make_uncached_transition_iterator(node_id, state), *existing);
+            if (const auto* cached = transition_cache.get(node_id, state)) {
+                return std::make_unique<BufferedTransitionIterator>(*this, *cached);
             }
 
-            CacheEntry& entry = transition_cache.get_or_create(node_id, state);
             return std::make_unique<WriteThroughIterator>(
-                    *this, make_uncached_transition_iterator(node_id, state), entry);
+                    *this, make_uncached_transition_iterator(node_id, state), transition_cache, node_id, state);
         }
 
     private:
