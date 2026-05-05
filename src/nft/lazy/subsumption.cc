@@ -18,6 +18,25 @@ SubsumptionEngine::SubsumptionEngine(const SubsumptionContext& context)
       precomputed_simulation_nfts(context.nfts.size()), antichain{}, buckets{}, caches{}, filter_lhs_nfa_index{},
       lhs_fwd_sim_neighbors{}, lhs_bwd_sim_neighbors{} {}
 
+namespace {
+
+    /// Walk through macrostate-transparent wrappers (Identity, Project) until a node that
+    /// owns its own macrostate store is reached. The macrostate id is invariant across
+    /// the walk (transparent kinds share their child's store).
+    NodeId resolve_macrostate_owner(const std::vector<ExecNode>& nodes, NodeId nid) {
+        while (nid < nodes.size()) {
+            const NodeKind k = nodes[nid].kind;
+            if (k == NodeKind::Identity || k == NodeKind::Project) {
+                nid = nodes[nid].lhs;
+            } else {
+                break;
+            }
+        }
+        return nid;
+    }
+
+} // namespace
+
 void SubsumptionEngine::initialize_leaf_simulations(const NodeId root_id) {
     antichain.clear();
     buckets.clear();
@@ -37,42 +56,61 @@ void SubsumptionEngine::initialize_leaf_simulations(const NodeId root_id) {
 
 void SubsumptionEngine::configure_antichain_filter(const NodeId root_id) {
     filter_root_node = root_id;
-    filter_kind = AntichainFilterKind::None;
-    filter_fingerprint_source_node = root_id;
+    fingerprint_program = FingerprintProgram{};
+    outer_key_program = OuterKeyProgram{};
 
     if (root_id >= context.nodes.size()) {
         return;
     }
 
-    const NodeKind root_kind = context.nodes[root_id].kind;
+    // Resolve the root through any leading transparent wrappers; macrostate ids are
+    // shared across the chain so the resolved node owns the relevant store.
+    const NodeId root_owner = resolve_macrostate_owner(context.nodes, root_id);
+    const NodeKind root_kind = context.nodes[root_owner].kind;
+
     switch (root_kind) {
         case NodeKind::Union:
-            // Subsumption requires matching tags — use the tag as a discriminator so only
-            // same-side entries are compared.
-            filter_kind = AntichainFilterKind::Tag;
+            // Subsumption requires matching tags — use the tag as an equality discriminator
+            // so only same-side entries are compared.
+            fingerprint_program.steps.push_back({FpOp::EmitTag, root_owner});
+            fingerprint_program.range_kind = FpRangeKind::Equality;
             break;
 
         case NodeKind::Complement:
-            // Subsumption for complement reverses the subset order: s1 ⊑ s2 iff sub(s2) ⊆ sub(s1).
-            // Smaller set states can only subsume larger or equal ones, so bucket by set size and
-            // check only entries with size ≤ the query.
-            filter_kind = AntichainFilterKind::RootSetSize;
+            // Complement subsumption reverses the subset order: s1 ⊑ s2 iff sub(s2) ⊆ sub(s1).
+            // Bucket by set size and check only entries with size ≤ the query.
+            fingerprint_program.steps.push_back({FpOp::EmitSetSize, root_owner});
+            fingerprint_program.range_kind = FpRangeKind::LessOrEqual;
             break;
 
         case NodeKind::Intersect:
-        case NodeKind::SyncProduct: {
-            // Language-inclusion pattern: Intersect(L, Complement(R)).  The rhs set state grows as
-            // the search progresses; bucket by its size for the same reason as RootSetSize.
-            const NodeId rhs = context.nodes[root_id].rhs;
-            if (rhs < context.nodes.size() && context.nodes[rhs].kind == NodeKind::Complement) {
-                filter_kind = AntichainFilterKind::IntersectRhsSetSize;
-                filter_fingerprint_source_node = rhs;
+        case NodeKind::SyncProduct:
+        case NodeKind::DiagonalSlice: {
+            // Look for a Complement on the rhs (possibly through transparent wrappers).
+            // Walking through Identity / Project is sound because they share their child's
+            // macrostate store, so the unpacked pair.rhs id is valid in the resolved
+            // Complement's set store.
+            const NodeId rhs_raw = context.nodes[root_owner].rhs;
+            const NodeId rhs_owner = resolve_macrostate_owner(context.nodes, rhs_raw);
 
-                // When the lhs is a plain NFA leaf we can also exploit its simulation relation to
-                // widen the antichain check across simulated lhs states.
-                const NodeId lhs = context.nodes[root_id].lhs;
-                if (context.nodes[lhs].kind == NodeKind::LeafNfa) {
-                    filter_lhs_nfa_index = context.nodes[lhs].lhs;
+            if (rhs_owner < context.nodes.size() &&
+                context.nodes[rhs_owner].kind == NodeKind::Complement) {
+                // Outer key: pair.lhs id (equality grouping — pair subsumption requires
+                // lhs1 ⊑ lhs2, which without sim means equality).
+                outer_key_program.steps.push_back({FpOp::UnpackPairLhs, root_owner});
+                outer_key_program.steps.push_back({FpOp::EmitId, 0});
+
+                // Inner fingerprint: pair.rhs → resolved Complement → set size.
+                fingerprint_program.steps.push_back({FpOp::UnpackPairRhs, root_owner});
+                fingerprint_program.steps.push_back({FpOp::EmitSetSize, rhs_owner});
+                fingerprint_program.range_kind = FpRangeKind::LessOrEqual;
+
+                // Simulation widening when the lhs (after wrapper walk) is a plain NFA leaf.
+                const NodeId lhs_raw = context.nodes[root_owner].lhs;
+                const NodeId lhs_owner = resolve_macrostate_owner(context.nodes, lhs_raw);
+                if (lhs_owner < context.nodes.size() &&
+                    context.nodes[lhs_owner].kind == NodeKind::LeafNfa) {
+                    filter_lhs_nfa_index = context.nodes[lhs_owner].lhs;
                 }
             }
             break;
@@ -84,30 +122,52 @@ void SubsumptionEngine::configure_antichain_filter(const NodeId root_id) {
 }
 
 uint32_t SubsumptionEngine::compute_fingerprint(const MacroStateId state) const {
-    switch (filter_kind) {
-        case AntichainFilterKind::Tag:
-            return static_cast<uint32_t>(context.macro_store.get_tagged(filter_root_node, state).tag);
-
-        case AntichainFilterKind::RootSetSize:
-            return static_cast<uint32_t>(context.macro_store.get_set(filter_root_node, state).size());
-
-        case AntichainFilterKind::IntersectRhsSetSize: {
-            const PairState pair = context.macro_store.get_pair(filter_root_node, state);
-            return static_cast<uint32_t>(context.macro_store.get_set(filter_fingerprint_source_node, pair.rhs).size());
+    MacroStateId cursor = state;
+    for (const FpInstr& instr : fingerprint_program.steps) {
+        switch (instr.op) {
+            case FpOp::UnpackPairLhs:
+                cursor = context.macro_store.get_pair(instr.node, cursor).lhs;
+                break;
+            case FpOp::UnpackPairRhs:
+                cursor = context.macro_store.get_pair(instr.node, cursor).rhs;
+                break;
+            case FpOp::EmitSetSize:
+                return static_cast<uint32_t>(context.macro_store.get_set(instr.node, cursor).size());
+            case FpOp::EmitTag:
+                return static_cast<uint32_t>(context.macro_store.get_tagged(instr.node, cursor).tag);
+            case FpOp::EmitId:
+                return static_cast<uint32_t>(cursor);
         }
-
-        case AntichainFilterKind::None:
-            break;
     }
-
     return 0;
 }
 
+MacroStateId SubsumptionEngine::compute_outer_key(const MacroStateId state) const {
+    if (outer_key_program.steps.empty()) {
+        return MacroStateId{0};
+    }
+    MacroStateId cursor = state;
+    for (const FpInstr& instr : outer_key_program.steps) {
+        switch (instr.op) {
+            case FpOp::UnpackPairLhs:
+                cursor = context.macro_store.get_pair(instr.node, cursor).lhs;
+                break;
+            case FpOp::UnpackPairRhs:
+                cursor = context.macro_store.get_pair(instr.node, cursor).rhs;
+                break;
+            case FpOp::EmitId:
+                return cursor;
+            case FpOp::EmitSetSize:
+            case FpOp::EmitTag:
+                // Not meaningful as outer keys; defensive fallthrough returns cursor.
+                return cursor;
+        }
+    }
+    return cursor;
+}
+
 SubsumptionEngine::InnerBuckets& SubsumptionEngine::inner_bucket(const MacroStateId state) {
-    const MacroStateId key = (filter_kind == AntichainFilterKind::IntersectRhsSetSize)
-                                     ? context.macro_store.get_pair(filter_root_node, state).lhs
-                                     : MacroStateId{0};
-    return buckets[key];
+    return buckets[compute_outer_key(state)];
 }
 
 std::vector<MacroStateId>& SubsumptionEngine::get_or_insert_bucket(InnerBuckets& inner, const uint32_t key) {
@@ -119,29 +179,27 @@ std::vector<MacroStateId>& SubsumptionEngine::get_or_insert_bucket(InnerBuckets&
     return it->second;
 }
 
-// check_range: the buckets that might contain an antichain entry subsuming the query state.
-// remove_range: the buckets that might contain entries the query state now makes redundant.
+// check_range: buckets that might contain an antichain entry subsuming the query state.
+// remove_range: buckets that might contain entries the query state now makes redundant.
 //
-// For Tag: subsumption requires equal tags, so only the exact-match bucket matters for both.
-// For set-size filters: s2 subsumes s1 iff sub(s2) ⊆ sub(s1), which means sub(s2) can be no
-// larger than sub(s1).  So:
-//   - check: candidates have size ≤ fp  (smaller or equal sets can subsume the query)
-//   - remove: candidates have size ≥ fp  (larger or equal sets may now be dominated)
+// Driven by fingerprint_program.range_kind:
+//   Equality:    only the exact-fp bucket matters for both check and remove.
+//   LessOrEqual: complement-style monotonicity. check = sizes ≤ fp; remove = sizes ≥ fp.
+//   All:         no useful inner discrimination — scan everything.
 
 SubsumptionEngine::BucketsRange SubsumptionEngine::check_range(InnerBuckets& inner, const uint32_t fp) const {
     const auto lower_cmp = [](const InnerBucket& b, uint32_t k) { return b.first < k; };
-    switch (filter_kind) {
-        case AntichainFilterKind::Tag: {
+    switch (fingerprint_program.range_kind) {
+        case FpRangeKind::Equality: {
             const auto it = std::lower_bound(inner.begin(), inner.end(), fp, lower_cmp);
             return (it != inner.end() && it->first == fp) ? BucketsRange{it, std::next(it)}
                                                           : BucketsRange{inner.end(), inner.end()};
         }
-        case AntichainFilterKind::RootSetSize:
-        case AntichainFilterKind::IntersectRhsSetSize: {
+        case FpRangeKind::LessOrEqual: {
             const auto upper_cmp = [](uint32_t k, const InnerBucket& b) { return k < b.first; };
             return {inner.begin(), std::upper_bound(inner.begin(), inner.end(), fp, upper_cmp)};
         }
-        case AntichainFilterKind::None:
+        case FpRangeKind::All:
             return {inner.begin(), inner.end()};
     }
     return {inner.begin(), inner.end()};
@@ -149,16 +207,15 @@ SubsumptionEngine::BucketsRange SubsumptionEngine::check_range(InnerBuckets& inn
 
 SubsumptionEngine::BucketsRange SubsumptionEngine::remove_range(InnerBuckets& inner, const uint32_t fp) const {
     const auto lower_cmp = [](const InnerBucket& b, uint32_t k) { return b.first < k; };
-    switch (filter_kind) {
-        case AntichainFilterKind::Tag: {
+    switch (fingerprint_program.range_kind) {
+        case FpRangeKind::Equality: {
             const auto it = std::lower_bound(inner.begin(), inner.end(), fp, lower_cmp);
             return (it != inner.end() && it->first == fp) ? BucketsRange{it, std::next(it)}
                                                           : BucketsRange{inner.end(), inner.end()};
         }
-        case AntichainFilterKind::RootSetSize:
-        case AntichainFilterKind::IntersectRhsSetSize:
+        case FpRangeKind::LessOrEqual:
             return {std::lower_bound(inner.begin(), inner.end(), fp, lower_cmp), inner.end()};
-        case AntichainFilterKind::None:
+        case FpRangeKind::All:
             return {inner.begin(), inner.end()};
     }
     return {inner.begin(), inner.end()};

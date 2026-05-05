@@ -197,35 +197,70 @@ private:
 
     /// Current antichain of non-subsumed states (flat view used by is_pruned).
     std::unordered_set<MacroStateId> antichain;
-    /// Antichain: outer key = lhs macrostate (IntersectRhsSetSize) or 0; inner key = fingerprint.
+    /// Antichain: outer key = result of @c outer_key_program (often pair.lhs id, else 0);
+    /// inner key = result of @c fingerprint_program. Both produced from the root macrostate.
     std::unordered_map<MacroStateId, InnerBuckets> buckets;
     /// Per-node subsumption caches.
     std::vector<SubsumptionCache> caches;
 
     /**
-     * @brief Kind of structural fingerprint used to bucket the antichain.
+     * @brief One step in a fingerprint or outer-key program.
      *
-     * Chosen from the root node kind when @c initialize_leaf_simulations is called.
-     * The fingerprint is a cheap necessary condition on subsumption at the root,
-     * letting the antichain scan skip entries that cannot possibly subsume a query.
+     * Programs are short scripts (≤ 4 steps in practice) compiled once at root
+     * setup time from the exec DAG's structural shape, then interpreted per
+     * @c is_subsumed call. Each step transforms the (cursor) macrostate or emits
+     * a final fingerprint value.
      */
-    enum class AntichainFilterKind : uint8_t {
-        /// No structural filter — fall back to scanning every entry.
-        None = 0,
-        /// Root is Union: fingerprint = TaggedState::Tag (subsumption requires equal tag).
-        Tag,
-        /// Root is Complement: fingerprint = |SetState| (subsumption reverses subset order).
-        RootSetSize,
-        /// Root is Intersect/SyncProduct with a Complement rhs:
-        /// fingerprint = |SetState of pair.rhs|.
-        IntersectRhsSetSize,
+    enum class FpOp : uint8_t {
+        /// Replace cursor with @c get_pair(node, cursor).lhs.
+        UnpackPairLhs,
+        /// Replace cursor with @c get_pair(node, cursor).rhs.
+        UnpackPairRhs,
+        /// Emit @c |get_set(node, cursor)| (range-based fingerprint).
+        EmitSetSize,
+        /// Emit @c get_tagged(node, cursor).tag (equality fingerprint).
+        EmitTag,
+        /// Emit @c cursor as the result (raw id; outer key or equality leaf id).
+        EmitId,
     };
 
-    /// Chosen filter kind for the current root.
-    AntichainFilterKind filter_kind = AntichainFilterKind::None;
-    /// Execution node whose macrostate view is used to compute the fingerprint.
-    NodeId filter_fingerprint_source_node = 0;
-    /// Root exec node used when computing fingerprints.
+    struct FpInstr {
+        /// Operation to perform.
+        FpOp op;
+        /// Exec node whose store the operation reads (ignored by EmitId).
+        NodeId node;
+    };
+
+    /**
+     * @brief Subsumption-direction semantics of the inner fingerprint.
+     *
+     * Determines how @c check_range and @c remove_range scan the sorted inner buckets.
+     */
+    enum class FpRangeKind : uint8_t {
+        /// No useful inner discrimination — single bucket, scan all entries.
+        All = 0,
+        /// Exact-match inner buckets (Tag, leaf id).
+        Equality,
+        /// Set-size monotonicity: smaller fp can subsume larger; larger fp may now be redundant.
+        LessOrEqual,
+    };
+
+    /// Compiled walk script that transforms a root macrostate into a uint32_t fingerprint.
+    struct FingerprintProgram {
+        SmallVector<FpInstr, 4> steps{};
+        FpRangeKind range_kind = FpRangeKind::All;
+    };
+
+    /// Compiled walk script that transforms a root macrostate into the outer bucket key.
+    struct OuterKeyProgram {
+        SmallVector<FpInstr, 4> steps{};
+    };
+
+    /// Compiled inner-fingerprint program for the current root.
+    FingerprintProgram fingerprint_program{};
+    /// Compiled outer-key program for the current root.
+    OuterKeyProgram outer_key_program{};
+    /// Root exec node used when computing fingerprints (also drives the lhs-sim widening).
     NodeId filter_root_node = 0;
 
     /// NFA leaf index for the LHS child when root is Intersect(LeafNfa, Complement(…)).
@@ -256,10 +291,13 @@ private:
     /// Choose an antichain filter strategy for the current root.
     void configure_antichain_filter(NodeId root_id);
 
-    /// Compute the structural fingerprint of @p state under the current filter.
+    /// Compute the inner-bucket fingerprint of @p state by interpreting @c fingerprint_program.
     uint32_t compute_fingerprint(MacroStateId state) const;
 
-    /// Select or create the inner bucket map for @p state given the current filter kind.
+    /// Compute the outer-bucket key of @p state by interpreting @c outer_key_program.
+    MacroStateId compute_outer_key(MacroStateId state) const;
+
+    /// Select or create the inner bucket map for @p state given the current outer-key program.
     InnerBuckets& inner_bucket(MacroStateId state);
 
     /// Returns the range of inner bucket entries that could subsume @p state.
@@ -274,8 +312,8 @@ private:
     /**
      * @brief Precompute per-NFA-state simulation neighbor lists for the LHS leaf.
      *
-     * Called only when @c filter_kind is @c IntersectRhsSetSize and the root Intersect
-     * node's LHS child is a @c LeafNfa.  After this call:
+     * Called only when the filter program identifies an LHS leaf NFA (with optional
+     * Identity / Project wrappers) at the root pair. After this call:
      *
      * - @c lhs_fwd_sim_neighbors[q] = { q' : q ≤_sim q' }
      *   Forward neighbors used in the *check* phase: antichain entries whose LHS
@@ -288,7 +326,7 @@ private:
     void build_lhs_sim_neighbors();
 
     /**
-     * @brief Simulation-aware fast path of @c is_subsumed for the @c IntersectRhsSetSize filter.
+     * @brief Simulation-aware fast path of @c is_subsumed when the LHS sim widening fires.
      *
      * Called when @c lhs_fwd_sim_neighbors is populated.  Scans all outer buckets
      * reachable via the precomputed simulation neighbors instead of only the bucket
