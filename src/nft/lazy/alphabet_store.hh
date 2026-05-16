@@ -72,10 +72,8 @@ public:
     bool try_resolve_symbol(
             const Automaton& automaton, NodeId node_id, uint8_t level, mata::Symbol local_symbol,
             mata::Symbol& resolved_symbol) const {
-        try {
-            const std::string symbol_name = symbol_name_for(automaton.alphabet, local_symbol);
-            return try_translate_symbol_name_to_resolved(node_id, level, symbol_name, resolved_symbol);
-        } catch (const std::runtime_error&) { return false; }
+        const std::string symbol_name = symbol_name_for(automaton.alphabet, local_symbol);
+        return try_translate_symbol_name_to_resolved(node_id, level, symbol_name, resolved_symbol);
     }
 
     /**

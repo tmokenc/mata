@@ -36,6 +36,12 @@ using namespace mata::nft::lazy;
 
 namespace {
 
+// Shared identity-alphabet pair reused by NFT helpers that have no domain-specific
+// alphabet to attach. IntAlphabet's singleton storage means every instance shares
+// the same internal state, so handing the same wrapper to every NFT is safe.
+IntAlphabet g_int_alphabet{};
+AlphabetLevels g_int_alphabets{ &g_int_alphabet };
+
 // ---------------------------------------------------------------------------
 // NFA helpers
 // ---------------------------------------------------------------------------
@@ -108,7 +114,7 @@ namespace {
 
 /// Relation { (in, out) } — accepts only the single pair of length-1 words.
 [[nodiscard]] Nft relation_single_pair(const Symbol in, const Symbol out) {
-    Nft nft = Nft::with_levels(2, 3, {0}, {2});
+    Nft nft = Nft::with_levels(2, 3, {0}, {2}, &g_int_alphabets);
     nft.levels[0] = 0;
     nft.levels[1] = 1;
     nft.levels[2] = 0; // final state; level value unused for accepted pairs
@@ -125,7 +131,7 @@ namespace {
     alphabet->add_new_symbol(in_name, in_local);
     alphabet->add_new_symbol(out_name, out_local);
 
-    Nft nft = Nft::with_levels(2, 3, {0}, {2}, alphabet);
+    Nft nft = Nft::with_levels(2, 3, {0}, {2}, new AlphabetLevels{ alphabet });
     nft.levels[0] = 0;
     nft.levels[1] = 1;
     nft.levels[2] = 0;
@@ -143,7 +149,8 @@ namespace {
     input_alphabet->add_new_symbol(in_name, in_local);
     output_alphabet->add_new_symbol(out_name, out_local);
 
-    Nft nft = Nft::with_levels(2, 3, {0}, {2}, std::vector<Alphabet*>{input_alphabet, output_alphabet});
+    Nft nft = Nft::with_levels(
+            2, 3, {0}, {2}, new AlphabetLevels{ std::vector<Alphabet*>{input_alphabet, output_alphabet} });
     nft.levels[0] = 0;
     nft.levels[1] = 1;
     nft.levels[2] = 0;
@@ -154,7 +161,7 @@ namespace {
 
 /// Relation { (in^n, out^n) | n >= 0 } — looping transducer, initial = final.
 [[nodiscard]] Nft universal_pair_loop(const Symbol in, const Symbol out) {
-    Nft nft = Nft::with_levels(2, 2, {0}, {0});
+    Nft nft = Nft::with_levels(2, 2, {0}, {0}, &g_int_alphabets);
     nft.levels[0] = 0;
     nft.levels[1] = 1;
     nft.delta.add(0, in, 1);
@@ -171,7 +178,8 @@ namespace {
     input_alphabet->add_new_symbol(in_name, in_local);
     output_alphabet->add_new_symbol(out_name, out_local);
 
-    Nft nft = Nft::with_levels(2, 2, {0}, {0}, std::vector<Alphabet*>{input_alphabet, output_alphabet});
+    Nft nft = Nft::with_levels(
+            2, 2, {0}, {0}, new AlphabetLevels{ std::vector<Alphabet*>{input_alphabet, output_alphabet} });
     nft.levels[0] = 0;
     nft.levels[1] = 1;
     nft.delta.add(0, in_local, 1);
@@ -181,7 +189,7 @@ namespace {
 
 /// NFT with transitions but no final states — accepts no pair.
 [[nodiscard]] Nft empty_nft(const Symbol in, const Symbol out) {
-    Nft nft = Nft::with_levels(2, 2, {0}, {});
+    Nft nft = Nft::with_levels(2, 2, {0}, {}, &g_int_alphabets);
     nft.levels[0] = 0;
     nft.levels[1] = 1;
     nft.delta.add(0, in, 1);
@@ -191,7 +199,7 @@ namespace {
 
 /// One dead initial state and one live initial state producing a single pair.
 [[nodiscard]] Nft two_initials_one_live_nft(const Symbol in, const Symbol out) {
-    Nft nft = Nft::with_levels(2, 4, {0, 1}, {3});
+    Nft nft = Nft::with_levels(2, 4, {0, 1}, {3}, &g_int_alphabets);
     nft.levels[0] = 0;
     nft.levels[1] = 0;
     nft.levels[2] = 1;
@@ -203,7 +211,7 @@ namespace {
 
 /// Relation { (a, b, c) } on three tracks.
 [[nodiscard]] Nft relation_single_triple(const Symbol a, const Symbol b, const Symbol c) {
-    Nft nft = Nft::with_levels(3, 4, {0}, {3});
+    Nft nft = Nft::with_levels(3, 4, {0}, {3}, &g_int_alphabets);
     nft.levels[0] = 0;
     nft.levels[1] = 1;
     nft.levels[2] = 2;
@@ -1068,7 +1076,7 @@ namespace {
 
 [[nodiscard]] Nft pair_a_a_and_b_b() {
     // Diagonal of {a, b}, accepts (a, a) and (b, b) only.
-    Nft nft = Nft::with_levels(2, 5, {0}, {2, 4});
+    Nft nft = Nft::with_levels(2, 5, {0}, {2, 4}, &g_int_alphabets);
     nft.levels[0] = 0;
     nft.levels[1] = 1;
     nft.levels[2] = 0;

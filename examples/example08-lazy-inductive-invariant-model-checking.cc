@@ -65,8 +65,8 @@ Nfa universal_language(const std::vector<Symbol>& symbols, Alphabet* alphabet) {
 }
 
 Nft single_symbol_relation(
-        const std::vector<std::pair<Symbol, Symbol>>& pairs, const std::vector<Alphabet*>& level_alphabets) {
-    Nft nft = Nft::with_levels(2, 1 + pairs.size(), {0}, {0}, level_alphabets);
+        const std::vector<std::pair<Symbol, Symbol>>& pairs, AlphabetLevels* alphabets) {
+    Nft nft = Nft::with_levels(2, 1 + pairs.size(), {0}, {0}, alphabets);
 
     nft.levels[0] = 0;
     for (size_t i = 0; i < pairs.size(); ++i) {
@@ -99,14 +99,16 @@ int main() {
     Nfa gamma_univ = universal_language({gamma_a, gamma_b}, &gamma);
 
     // delta abstracts one step on Gamma: A -> B and B -> B.
-    Nft delta = single_symbol_relation({{gamma_a, gamma_b}, {gamma_b, gamma_b}}, {&gamma, &gamma});
+    AlphabetLevels delta_alphabets{ std::vector<Alphabet*>{&gamma, &gamma} };
+    Nft delta = single_symbol_relation({{gamma_a, gamma_b}, {gamma_b, gamma_b}}, &delta_alphabets);
 
     // Interpretation:
     //   A means concrete symbol 0
     //   B means concrete symbol 1
     //
     // `v` goes from Gamma to Sigma.
-    Nft v = single_symbol_relation({{gamma_a, sigma_0}, {gamma_b, sigma_1}}, {&gamma, &sigma});
+    AlphabetLevels v_alphabets{ std::vector<Alphabet*>{&gamma, &sigma} };
+    Nft v = single_symbol_relation({{gamma_a, sigma_0}, {gamma_b, sigma_1}}, &v_alphabets);
 
     SymbolicFormula tree;
 

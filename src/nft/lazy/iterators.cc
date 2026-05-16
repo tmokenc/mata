@@ -92,22 +92,9 @@ void TransitionTupleHelper::initialize_special_symbol_cache() {
 
 std::optional<mata::Symbol> TransitionTupleHelper::resolve_special_symbol_id(
         const NodeId node_id, const uint8_t level, const mata::Symbol special_symbol) const {
-    const mata::Alphabet& alphabet = alphabets.level_alphabet(node_id, level);
-    // IntAlphabet uses raw integers directly — the special symbol constant IS the canonical ID.
-    if (dynamic_cast<const mata::IntAlphabet*>(&alphabet) != nullptr) {
-        return special_symbol;
-    }
-
-    // OnTheFlyAlphabet stores symbols by name; look up by the numeric string the encoder would use.
-    try {
-        for (const mata::Symbol symbol : alphabet.get_alphabet_symbols()) {
-            if (alphabet.reverse_translate_symbol(symbol) == std::to_string(special_symbol)) {
-                return symbol;
-            }
-        }
-    } catch (const std::runtime_error&) {}
-
-    return std::nullopt;
+    const auto& map = alphabets.level_alphabet(node_id, level).get_symbol_map();
+    const auto it = map.find(std::to_string(special_symbol));
+    return it != map.end() ? std::optional<mata::Symbol>{it->second} : std::nullopt;
 }
 
 bool TransitionTupleHelper::is_resolved_epsilon(const SymbolRef ref) const {

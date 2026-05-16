@@ -153,21 +153,11 @@ namespace {
 
         std::vector<ExecNode> nodes;
         std::vector<CompiledSyncPlan> sync_plans;
-        /// Per-exec-node type-erased plan pointer, parallel to @c nodes.
-        ///
-        /// For each exec node, the slot is interpreted by the node's @c ExecKind:
-        ///   - @c ExecKind::Project       → cast to @c const ProjectPlan*
-        ///                                  (points into @c formula.project_plans).
-        ///   - @c ExecKind::SyncProduct   → cast to @c const CompiledSyncPlan*
-        ///                                  (points into @c this->sync_plans).
-        ///   - all other kinds             → @c nullptr.
-        ///
-        /// Lifetime invariant: the pointed-to plans must remain live and at the same
-        /// address until @c is_empty returns. @c formula is held by const ref by
-        /// @c is_empty (so @c formula.project_plans cannot be modified or relocated),
-        /// and @c sync_plans is built once by @c compile_sync_plans before
-        /// reconstruction and never resized afterwards. Do not push_back into either
-        /// vector after Context construction completes.
+        /// Per-exec-node plan pointer, type-erased and dispatched by the node's @c ExecKind
+        /// at the cast site (Project → @c ProjectPlan*, SyncProduct → @c CompiledSyncPlan*,
+        /// otherwise nullptr). The pointers alias @c formula.project_plans and @c sync_plans;
+        /// both must stay at the same address for the whole @c is_empty call — neither may be
+        /// resized after Context construction.
         std::vector<const void*> plan_at_node;
         MacroStateStore macro_store_;
         AlphabetStore alphabets;

@@ -58,7 +58,7 @@ namespace {
 
                     for (const auto& symbol_post : nft.delta.state_post(state)) {
                         node_level_alphabets[level].translate_symb(
-                                AlphabetStore::symbol_name_for(nft.alphabet_of_level(level), symbol_post.symbol));
+                                AlphabetStore::symbol_name_for(&nft.alphabets->for_level(level), symbol_post.symbol));
                     }
                 }
                 break;
@@ -358,10 +358,8 @@ AlphabetStore::AlphabetStore(
 bool AlphabetStore::try_resolve_symbol(
         const mata::nft::Nft& nft, const uint8_t source_level, const NodeId node_id, const uint8_t result_level,
         const mata::Symbol local_symbol, mata::Symbol& resolved_symbol) const {
-    try {
-        const std::string symbol_name = symbol_name_for(nft.alphabet_of_level(source_level), local_symbol);
-        return try_translate_symbol_name_to_resolved(node_id, result_level, symbol_name, resolved_symbol);
-    } catch (const std::runtime_error&) { return false; }
+    const std::string symbol_name = symbol_name_for(&nft.alphabets->for_level(source_level), local_symbol);
+    return try_translate_symbol_name_to_resolved(node_id, result_level, symbol_name, resolved_symbol);
 }
 
 
