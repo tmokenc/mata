@@ -293,20 +293,104 @@ enum class VisitState : uint8_t {
 }
 
 /**
+ * @brief Reconstructed-DAG operator kind.
+ *
+ * Mirrors the public @c NodeKind plus @c DiagonalSlice, which is materialised
+ * only by the reconstruction pass and never appears in user-built DAGs. Keeping
+ * a separate enum lets the public @c NodeKind stay limited to operations a user
+ * can actually construct.
+ */
+enum class ExecKind : uint8_t {
+    LeafNfa,
+    LeafNft,
+    Union,
+    Intersect,
+    Complement,
+    Identity,
+    Project,
+    SyncProduct,
+    DiagonalSlice,
+};
+
+/// Map a public @c NodeKind to its identical @c ExecKind value.
+constexpr ExecKind to_exec_kind(const NodeKind kind) noexcept {
+    return static_cast<ExecKind>(kind);
+}
+
+/// Throw a uniform diagnostic for an @c ExecKind that should never reach a given switch.
+[[noreturn]] inline void unreachable_kind(const ExecKind kind, const char* context) {
+    throw std::logic_error(
+            std::string("Unreachable ") + context + " for ExecKind " + std::to_string(static_cast<int>(kind)));
+}
+
+/**
  * @brief Compact reconstructed execution node.
+ *
+ * The plan owned by @c Project / @c SyncProduct exec nodes is reached through
+ * the Context's parallel @c plan_at_node side vector, dispatched by @c kind.
+ * No payload field lives on the node itself.
  */
 struct ExecNode {
-    /// Operator kind (mirrors NodeKind from the public DAG).
-    NodeKind kind;
+    /// Operator kind in the reconstructed DAG.
+    ExecKind kind;
     /// Result arity of the reconstructed node.
     uint8_t result_arity;
     /// Left child or leaf index.
     NodeId lhs;
     /// Right child when present.
     NodeId rhs;
-    /// Index into auxiliary plan tables when needed.
-    uint32_t payload;
 };
+
+/**
+ * @brief Internal sync-plan form with precomputed per-level peer lookup.
+ *
+ * Lives here (rather than in iterators.hh) so alphabet_store and other internal
+ * modules can read sync-plan fields through @c plan_at_node without dragging
+ * the iterator headers in.
+ */
+struct CompiledSyncPlan {
+    SmallVec2<uint8_t> lhs_sync_levels{};
+    SmallVec2<uint8_t> rhs_sync_levels{};
+    SmallVec2<LevelRef> result_layout{};
+    SmallVec2<int16_t> lhs_sync_peer_by_level{};
+    SmallVec2<int16_t> rhs_sync_peer_by_level{};
+};
+
+/// Sentinel returned by @c compute_user_node_plan_indices for nodes that own no plan.
+inline constexpr uint32_t kNoPlanIndex = static_cast<uint32_t>(-1);
+
+/**
+ * @brief Build the positional plan index for every node in @p formula.
+ *
+ * Walks @c formula.nodes in id order, assigning each @c Project node the next
+ * @c project_plans index and each @c SyncProduct node the next @c sync_plans
+ * index. Other nodes get @c kNoPlanIndex. The mapping is positional because
+ * builder methods append plans atomically with their owning nodes.
+ *
+ * Used by reconstruction and validation; built lazily and discarded after the
+ * relevant walk.
+ *
+ * @param formula User-built symbolic formula.
+ * @return Vector of size @c formula.nodes.size() of plan indices or @c kNoPlanIndex.
+ */
+inline std::vector<uint32_t> compute_user_node_plan_indices(const SymbolicFormula& formula) {
+    std::vector<uint32_t> result(formula.nodes.size(), kNoPlanIndex);
+    uint32_t project_count = 0;
+    uint32_t sync_count = 0;
+    for (size_t i = 0; i < formula.nodes.size(); ++i) {
+        switch (formula.nodes[i].kind) {
+            case NodeKind::Project:
+                result[i] = project_count++;
+                break;
+            case NodeKind::SyncProduct:
+                result[i] = sync_count++;
+                break;
+            default:
+                break;
+        }
+    }
+    return result;
+}
 
 /**
  * @brief Mix one integer into a stable 64-bit hash state.

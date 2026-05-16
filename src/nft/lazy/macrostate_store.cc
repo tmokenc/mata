@@ -80,21 +80,21 @@ MacroStateStore::MacroStateStore(
     size_t tagged_node_count = 0;
     for (const ExecNode& node : nodes) {
         switch (node.kind) {
-            case NodeKind::Union:
+            case ExecKind::Union:
                 tagged_node_count += 1;
                 break;
-            case NodeKind::Intersect:
-            case NodeKind::SyncProduct:
-            case NodeKind::DiagonalSlice:
+            case ExecKind::Intersect:
+            case ExecKind::SyncProduct:
+            case ExecKind::DiagonalSlice:
                 pair_node_count += 1;
                 break;
-            case NodeKind::Complement:
+            case ExecKind::Complement:
                 set_node_count += 1;
                 break;
-            case NodeKind::LeafNfa:
-            case NodeKind::LeafNft:
-            case NodeKind::Identity:
-            case NodeKind::Project:
+            case ExecKind::LeafNfa:
+            case ExecKind::LeafNft:
+            case ExecKind::Identity:
+            case ExecKind::Project:
                 break;
         }
     }
@@ -110,23 +110,23 @@ MacroStateStore::MacroStateStore(
 
     for (size_t i = 0; i < nodes.size(); ++i) {
         switch (nodes[i].kind) {
-            case NodeKind::LeafNfa:
+            case ExecKind::LeafNfa:
                 dense_macrostate_bounds[i] = nfas[nodes[i].lhs].num_of_states();
                 break;
 
-            case NodeKind::LeafNft:
+            case ExecKind::LeafNft:
                 dense_macrostate_bounds[i] = nfts[nodes[i].lhs].num_of_states();
                 break;
 
-            case NodeKind::Union:
+            case ExecKind::Union:
                 node_to_store_index[i] = tagged_stores.size();
                 tagged_stores.emplace_back();
                 dense_macrostate_bounds[i] = std::nullopt;
                 break;
 
-            case NodeKind::Intersect:
-            case NodeKind::SyncProduct:
-            case NodeKind::DiagonalSlice: {
+            case ExecKind::Intersect:
+            case ExecKind::SyncProduct:
+            case ExecKind::DiagonalSlice: {
                 const std::optional<size_t> lhs_bound = dense_macrostate_bounds[nodes[i].lhs];
                 const std::optional<size_t> rhs_bound = dense_macrostate_bounds[nodes[i].rhs];
                 node_to_store_index[i] = pair_stores.size();
@@ -140,14 +140,14 @@ MacroStateStore::MacroStateStore(
                 break;
             }
 
-            case NodeKind::Complement:
+            case ExecKind::Complement:
                 node_to_store_index[i] = set_stores.size();
                 set_stores.emplace_back();
                 dense_macrostate_bounds[i] = std::nullopt;
                 break;
 
-            case NodeKind::Identity:
-            case NodeKind::Project:
+            case ExecKind::Identity:
+            case ExecKind::Project:
                 dense_macrostate_bounds[i] = dense_macrostate_bounds[nodes[i].lhs];
                 break;
         }

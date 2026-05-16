@@ -37,17 +37,6 @@ using InitialStateIteratorPtr = std::unique_ptr<InitialStateIterator>;
 using TransitionIteratorPtr = std::unique_ptr<TransitionIterator>;
 
 /**
- * @brief Internal sync-plan form with precomputed per-level peer lookup.
- */
-struct CompiledSyncPlan {
-    SmallVec2<uint8_t> lhs_sync_levels{};
-    SmallVec2<uint8_t> rhs_sync_levels{};
-    SmallVec2<LevelRef> result_layout{};
-    SmallVec2<int16_t> lhs_sync_peer_by_level{};
-    SmallVec2<int16_t> rhs_sync_peer_by_level{};
-};
-
-/**
  * @brief Resolved special symbols cached per exec node and level.
  */
 struct ResolvedSpecialSymbols {

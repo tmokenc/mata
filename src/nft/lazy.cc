@@ -82,37 +82,30 @@ namespace {
 } // namespace
 
 // -----------------------------------------------------------------------------
-// Internal node/plan insertion
+// Internal node insertion
+//
+// Plans are associated with their owning node positionally: the k-th `Project`
+// node corresponds to `project_plans[k]`, and the k-th `SyncProduct` node to
+// `sync_plans[k]`. To preserve this invariant, callers MUST append a plan
+// immediately before inserting its node; never reorder or interleave.
 // -----------------------------------------------------------------------------
 
 NodeId SymbolicFormula::insert_leaf(NodeKind kind, NodeId leaf_id, uint8_t result_arity) {
     const NodeId id = static_cast<NodeId>(nodes.size());
-    nodes.push_back(Node{kind, result_arity, leaf_id, 0, NO_PAYLOAD});
+    nodes.push_back(Node{kind, result_arity, leaf_id, 0});
     return id;
 }
 
-NodeId SymbolicFormula::insert_unary(NodeKind kind, NodeId child, uint8_t result_arity, uint32_t payload) {
+NodeId SymbolicFormula::insert_unary(NodeKind kind, NodeId child, uint8_t result_arity) {
     const NodeId id = static_cast<NodeId>(nodes.size());
-    nodes.push_back(Node{kind, result_arity, child, 0, payload});
+    nodes.push_back(Node{kind, result_arity, child, 0});
     return id;
 }
 
-NodeId SymbolicFormula::insert_binary(NodeKind kind, NodeId lhs, NodeId rhs, uint8_t result_arity, uint32_t payload) {
+NodeId SymbolicFormula::insert_binary(NodeKind kind, NodeId lhs, NodeId rhs, uint8_t result_arity) {
     const NodeId id = static_cast<NodeId>(nodes.size());
-    nodes.push_back(Node{kind, result_arity, lhs, rhs, payload});
+    nodes.push_back(Node{kind, result_arity, lhs, rhs});
     return id;
-}
-
-uint32_t SymbolicFormula::add_sync_plan(SyncPlan plan) {
-    const uint32_t payload = static_cast<uint32_t>(sync_plans.size());
-    sync_plans.push_back(std::move(plan));
-    return payload;
-}
-
-uint32_t SymbolicFormula::add_project_plan(ProjectPlan plan) {
-    const uint32_t payload = static_cast<uint32_t>(project_plans.size());
-    project_plans.push_back(std::move(plan));
-    return payload;
 }
 
 // -----------------------------------------------------------------------------
@@ -154,8 +147,8 @@ Term SymbolicFormula::identity(const Term& sub) {
 
 Term SymbolicFormula::project(const Term& sub, const std::vector<uint8_t>& kept_levels) {
     require_unique_levels_in_range("project", "kept levels", kept_levels, arity_of(sub));
-    const uint32_t payload = add_project_plan(ProjectPlan{kept_levels});
-    return insert_unary(NodeKind::Project, sub.get_id(), static_cast<uint8_t>(kept_levels.size()), payload);
+    project_plans.push_back(ProjectPlan{kept_levels});
+    return insert_unary(NodeKind::Project, sub.get_id(), static_cast<uint8_t>(kept_levels.size()));
 }
 
 Term SymbolicFormula::sync_product(
@@ -183,9 +176,9 @@ Term SymbolicFormula::sync_product(
         }
     }
 
-    const uint32_t payload = add_sync_plan(SyncPlan{lhs_sync_levels, rhs_sync_levels, result_layout});
+    sync_plans.push_back(SyncPlan{lhs_sync_levels, rhs_sync_levels, result_layout});
     return insert_binary(
-            NodeKind::SyncProduct, lhs.get_id(), rhs.get_id(), static_cast<uint8_t>(result_layout.size()), payload);
+            NodeKind::SyncProduct, lhs.get_id(), rhs.get_id(), static_cast<uint8_t>(result_layout.size()));
 }
 
 Term SymbolicFormula::compose(

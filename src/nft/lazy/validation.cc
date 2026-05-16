@@ -90,7 +90,9 @@ namespace {
         return node.result_arity == plan.kept_levels.size();
     }
 
-    bool validate_node(const SymbolicFormula& tree, const NodeId node_id, std::vector<VisitState>& marks) {
+    bool validate_node(
+            const SymbolicFormula& tree, const NodeId node_id, const std::vector<uint32_t>& plan_indices,
+            std::vector<VisitState>& marks) {
         if (node_id >= tree.nodes.size()) {
             return false;
         }
@@ -110,48 +112,46 @@ namespace {
 
         switch (node.kind) {
             case NodeKind::LeafNfa:
-                ok = node.lhs < tree.nfas.size() && node.payload == NO_PAYLOAD && node.result_arity == 1;
+                ok = node.lhs < tree.nfas.size() && node.result_arity == 1;
                 break;
 
             case NodeKind::LeafNft:
-                ok = node.lhs < tree.nfts.size() && node.payload == NO_PAYLOAD &&
+                ok = node.lhs < tree.nfts.size() &&
                      node.result_arity == tree.nfts[node.lhs].levels.num_of_levels;
                 break;
 
             case NodeKind::Union:
             case NodeKind::Intersect:
-                ok = node.payload == NO_PAYLOAD && validate_node(tree, node.lhs, marks) &&
-                     validate_node(tree, node.rhs, marks) &&
+                ok = validate_node(tree, node.lhs, plan_indices, marks) &&
+                     validate_node(tree, node.rhs, plan_indices, marks) &&
                      tree.nodes[node.lhs].result_arity == tree.nodes[node.rhs].result_arity &&
                      node.result_arity == tree.nodes[node.lhs].result_arity;
                 break;
 
             case NodeKind::Complement:
-                ok = node.payload == NO_PAYLOAD && validate_node(tree, node.lhs, marks) &&
+                ok = validate_node(tree, node.lhs, plan_indices, marks) &&
                      node.result_arity == tree.nodes[node.lhs].result_arity;
                 break;
 
             case NodeKind::Identity:
-                ok = node.payload == NO_PAYLOAD && validate_node(tree, node.lhs, marks) &&
+                ok = validate_node(tree, node.lhs, plan_indices, marks) &&
                      tree.nodes[node.lhs].result_arity == 1 && node.result_arity == 2;
                 break;
 
-            case NodeKind::Project:
-                ok = validate_node(tree, node.lhs, marks) && node.payload < tree.project_plans.size() &&
-                     validate_project_plan(tree, node, tree.project_plans[node.payload]);
+            case NodeKind::Project: {
+                const uint32_t plan_idx = plan_indices[node_id];
+                ok = validate_node(tree, node.lhs, plan_indices, marks) && plan_idx < tree.project_plans.size() &&
+                     validate_project_plan(tree, node, tree.project_plans[plan_idx]);
                 break;
+            }
 
-            case NodeKind::SyncProduct:
-                ok = validate_node(tree, node.lhs, marks) && validate_node(tree, node.rhs, marks) &&
-                     node.payload < tree.sync_plans.size() &&
-                     validate_sync_plan(tree, node, tree.sync_plans[node.payload]);
+            case NodeKind::SyncProduct: {
+                const uint32_t plan_idx = plan_indices[node_id];
+                ok = validate_node(tree, node.lhs, plan_indices, marks) &&
+                     validate_node(tree, node.rhs, plan_indices, marks) && plan_idx < tree.sync_plans.size() &&
+                     validate_sync_plan(tree, node, tree.sync_plans[plan_idx]);
                 break;
-
-            case NodeKind::DiagonalSlice:
-                // Reconstruction-only node, the public API never produces it, so a user-built
-                // formula that contains it is malformed.
-                ok = false;
-                break;
+            }
         }
 
         marks[node_id] = ok ? VisitState::Done : VisitState::Unseen;
@@ -161,7 +161,8 @@ namespace {
 
 bool is_valid(const SymbolicFormula& tree, const Term& root_node) {
     std::vector<VisitState> marks(tree.nodes.size(), VisitState::Unseen);
-    return validate_node(tree, root_node.get_id(), marks);
+    const std::vector<uint32_t> plan_indices = compute_user_node_plan_indices(tree);
+    return validate_node(tree, root_node.get_id(), plan_indices, marks);
 }
 
 } // namespace mata::nft::lazy::detail

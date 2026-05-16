@@ -160,8 +160,8 @@ TEST_CASE("mata::nft::lazy is_valid should reject cycles") {
         // Node 0: LeafNfa referencing nfas[0]  (valid leaf, needed as base)
         // Node 1: Complement whose child is node 1 (self-loop)
         tree.nodes = {
-                {NodeKind::LeafNfa, 1, 0, 0, NO_PAYLOAD},
-                {NodeKind::Complement, 1, 1, 0, NO_PAYLOAD},
+                {NodeKind::LeafNfa, 1, 0, 0},
+                {NodeKind::Complement, 1, 1, 0},
         };
         CHECK_FALSE(tree.is_valid(Term{1}));
     }
@@ -173,8 +173,8 @@ TEST_CASE("mata::nft::lazy is_valid should reject cycles") {
         // Node 0: Union(node 1, node 1)
         // Node 1: Complement(node 0)  -- back-edge to node 0
         tree.nodes = {
-                {NodeKind::Union, 1, 1, 1, NO_PAYLOAD},
-                {NodeKind::Complement, 1, 0, 0, NO_PAYLOAD},
+                {NodeKind::Union, 1, 1, 1},
+                {NodeKind::Complement, 1, 0, 0},
         };
         CHECK_FALSE(tree.is_valid(Term{0}));
     }
@@ -186,9 +186,9 @@ TEST_CASE("mata::nft::lazy is_valid should reject cycles") {
         // Node 1: Complement(node 0)
         // Node 2: Complement(node 1)
         tree.nodes = {
-                {NodeKind::Complement, 1, 2, 0, NO_PAYLOAD},
-                {NodeKind::Complement, 1, 0, 0, NO_PAYLOAD},
-                {NodeKind::Complement, 1, 1, 0, NO_PAYLOAD},
+                {NodeKind::Complement, 1, 2, 0},
+                {NodeKind::Complement, 1, 0, 0},
+                {NodeKind::Complement, 1, 1, 0},
         };
         CHECK_FALSE(tree.is_valid(Term{2}));
     }
@@ -199,8 +199,8 @@ TEST_CASE("mata::nft::lazy is_valid should reject cycles") {
         // Node 0: LeafNfa (valid, reachable)
         // Node 1: Complement(node 1) -- self-loop, but NOT reachable from node 0
         tree.nodes = {
-                {NodeKind::LeafNfa, 1, 0, 0, NO_PAYLOAD},
-                {NodeKind::Complement, 1, 1, 0, NO_PAYLOAD},
+                {NodeKind::LeafNfa, 1, 0, 0},
+                {NodeKind::Complement, 1, 1, 0},
         };
         // Validating from node 0 should succeed; the cycle at node 1 is unreachable.
         CHECK(tree.is_valid(Term{0}));

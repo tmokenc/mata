@@ -38,7 +38,7 @@ namespace {
         level_alphabets[node_id].resize(node.result_arity);
 
         switch (node.kind) {
-            case NodeKind::LeafNfa: {
+            case ExecKind::LeafNfa: {
                 const mata::nfa::Nfa& nfa = nfas[node.lhs];
                 mata::OnTheFlyAlphabet& alphabet = level_alphabets[node_id][0];
                 for (const auto& state_post : nfa.delta) {
@@ -49,7 +49,7 @@ namespace {
                 break;
             }
 
-            case NodeKind::LeafNft: {
+            case ExecKind::LeafNft: {
                 const mata::nft::Nft& nft = nfts[node.lhs];
                 SmallVec2<mata::OnTheFlyAlphabet>& node_level_alphabets = level_alphabets[node_id];
                 for (mata::nfa::State state = 0; state < nft.delta.num_of_states(); ++state) {
@@ -64,17 +64,17 @@ namespace {
                 break;
             }
 
-            case NodeKind::Union:
-            case NodeKind::Intersect:
-            case NodeKind::SyncProduct:
-            case NodeKind::DiagonalSlice:
+            case ExecKind::Union:
+            case ExecKind::Intersect:
+            case ExecKind::SyncProduct:
+            case ExecKind::DiagonalSlice:
                 collect_local_level_alphabets(nodes, node.lhs, nfas, nfts, level_alphabets, visited);
                 collect_local_level_alphabets(nodes, node.rhs, nfas, nfts, level_alphabets, visited);
                 break;
 
-            case NodeKind::Complement:
-            case NodeKind::Identity:
-            case NodeKind::Project:
+            case ExecKind::Complement:
+            case ExecKind::Identity:
+            case ExecKind::Project:
                 collect_local_level_alphabets(nodes, node.lhs, nfas, nfts, level_alphabets, visited);
                 break;
         }
@@ -90,8 +90,7 @@ namespace {
     // this function every node's level_alphabets[node][level] points to the canonical alphabet of
     // its equivalence class.
     void canonicalize_level_alphabets(
-            const std::vector<ExecNode>& nodes, const NodeId root_id, const std::vector<SyncPlan>& sync_plans,
-            const std::vector<ProjectPlan>& project_plans,
+            const std::vector<ExecNode>& nodes, const NodeId root_id, const std::vector<const void*>& plan_at_node,
             std::vector<SmallVec2<mata::OnTheFlyAlphabet>>& level_alphabets,
             const std::vector<mata::OnTheFlyAlphabet>* root_level_alphabets) {
         // Assign a flat integer index to each (node_id, level) pair so union-find can use plain arrays.
@@ -147,39 +146,39 @@ namespace {
             const ExecNode& node = nodes[node_id];
 
             switch (node.kind) {
-                case NodeKind::LeafNfa:
-                case NodeKind::LeafNft:
+                case ExecKind::LeafNfa:
+                case ExecKind::LeafNft:
                     break;
 
-                case NodeKind::Union:
-                case NodeKind::Intersect:
+                case ExecKind::Union:
+                case ExecKind::Intersect:
                     for (uint8_t level = 0; level < node.result_arity; ++level) {
                         unite(level_index(node_id, level), level_index(node.lhs, level));
                         unite(level_index(node_id, level), level_index(node.rhs, level));
                     }
                     break;
 
-                case NodeKind::Complement:
+                case ExecKind::Complement:
                     for (uint8_t level = 0; level < node.result_arity; ++level) {
                         unite(level_index(node_id, level), level_index(node.lhs, level));
                     }
                     break;
 
-                case NodeKind::Identity:
+                case ExecKind::Identity:
                     unite(level_index(node_id, 0), level_index(node.lhs, 0));
                     unite(level_index(node_id, 1), level_index(node.lhs, 0));
                     break;
 
-                case NodeKind::Project: {
-                    const ProjectPlan& plan = project_plans[node.payload];
+                case ExecKind::Project: {
+                    const auto& plan = *static_cast<const ProjectPlan*>(plan_at_node[node_id]);
                     for (uint8_t level = 0; level < node.result_arity; ++level) {
                         unite(level_index(node_id, level), level_index(node.lhs, plan.kept_levels[level]));
                     }
                     break;
                 }
 
-                case NodeKind::SyncProduct: {
-                    const SyncPlan& plan = sync_plans[node.payload];
+                case ExecKind::SyncProduct: {
+                    const auto& plan = *static_cast<const CompiledSyncPlan*>(plan_at_node[node_id]);
                     for (size_t i = 0; i < plan.lhs_sync_levels.size(); ++i) {
                         unite(level_index(node.lhs, plan.lhs_sync_levels[i]),
                               level_index(node.rhs, plan.rhs_sync_levels[i]));
@@ -194,7 +193,7 @@ namespace {
                     break;
                 }
 
-                case NodeKind::DiagonalSlice:
+                case ExecKind::DiagonalSlice:
                     // Result is arity 1, both rhs tapes are forced equal (diagonal), and the lhs
                     // language must agree with that shared symbol. So all four positions live in
                     // one equivalence class, the result level, lhs[0], rhs[0], and rhs[1].
@@ -235,7 +234,7 @@ namespace {
     }
 
     void compute_effective_symbol_lists(
-            const std::vector<ExecNode>& nodes, const std::vector<ProjectPlan>& project_plans,
+            const std::vector<ExecNode>& nodes, const std::vector<const void*>& plan_at_node,
             const std::vector<SmallVec2<std::vector<mata::Symbol>>>& symbol_lists,
             std::vector<SmallVec2<std::vector<mata::Symbol>>>& effective) {
         effective.resize(nodes.size());
@@ -246,21 +245,21 @@ namespace {
             effective[node_id].resize(node.result_arity);
 
             switch (node.kind) {
-                case NodeKind::LeafNfa:
-                case NodeKind::LeafNft:
+                case ExecKind::LeafNfa:
+                case ExecKind::LeafNft:
                     for (uint8_t level = 0; level < node.result_arity; ++level) {
                         effective[node_id][level] = symbol_lists[node_id][level];
                     }
                     break;
 
-                case NodeKind::Complement:
+                case ExecKind::Complement:
                     // Complement explicitly sweeps all canonical symbols → full alphabet.
                     for (uint8_t level = 0; level < node.result_arity; ++level) {
                         effective[node_id][level] = symbol_lists[node_id][level];
                     }
                     break;
 
-                case NodeKind::Union:
+                case ExecKind::Union:
                     for (uint8_t level = 0; level < node.result_arity; ++level) {
                         const auto& lhs = effective[node.lhs][level];
                         const auto& rhs = effective[node.rhs][level];
@@ -270,7 +269,7 @@ namespace {
                     }
                     break;
 
-                case NodeKind::Intersect:
+                case ExecKind::Intersect:
                     for (uint8_t level = 0; level < node.result_arity; ++level) {
                         const auto& lhs = effective[node.lhs][level];
                         const auto& rhs = effective[node.rhs][level];
@@ -281,27 +280,27 @@ namespace {
                     }
                     break;
 
-                case NodeKind::SyncProduct:
+                case ExecKind::SyncProduct:
                     // Conservative: use the full canonical alphabet.
                     for (uint8_t level = 0; level < node.result_arity; ++level) {
                         effective[node_id][level] = symbol_lists[node_id][level];
                     }
                     break;
 
-                case NodeKind::Identity:
+                case ExecKind::Identity:
                     effective[node_id][0] = effective[node.lhs][0];
                     effective[node_id][1] = effective[node.lhs][0];
                     break;
 
-                case NodeKind::Project: {
-                    const ProjectPlan& plan = project_plans[node.payload];
+                case ExecKind::Project: {
+                    const auto& plan = *static_cast<const ProjectPlan*>(plan_at_node[node_id]);
                     for (uint8_t level = 0; level < node.result_arity; ++level) {
                         effective[node_id][level] = effective[node.lhs][plan.kept_levels[level]];
                     }
                     break;
                 }
 
-                case NodeKind::DiagonalSlice: {
+                case ExecKind::DiagonalSlice: {
                     // Effective alphabet is the intersection of the language's level 0 and the
                     // diagonal symbols of the relation, which means symbols that appear on both
                     // tapes of the relation. Approximated as the intersection of all three.
@@ -337,12 +336,12 @@ std::string AlphabetStore::symbol_name_for(const mata::Alphabet* alphabet, const
 
 AlphabetStore::AlphabetStore(
         const std::vector<ExecNode>& nodes, const NodeId root_id, const std::vector<mata::nfa::Nfa>& nfas,
-        const std::vector<mata::nft::Nft>& nfts, const std::vector<SyncPlan>& sync_plans,
-        const std::vector<ProjectPlan>& project_plans, const std::vector<mata::OnTheFlyAlphabet>* root_level_alphabets)
+        const std::vector<mata::nft::Nft>& nfts, const std::vector<const void*>& plan_at_node,
+        const std::vector<mata::OnTheFlyAlphabet>* root_level_alphabets)
     : level_alphabets(nodes.size()) {
     std::vector<bool> visited(nodes.size(), false);
     collect_local_level_alphabets(nodes, root_id, nfas, nfts, level_alphabets, visited);
-    canonicalize_level_alphabets(nodes, root_id, sync_plans, project_plans, level_alphabets, root_level_alphabets);
+    canonicalize_level_alphabets(nodes, root_id, plan_at_node, level_alphabets, root_level_alphabets);
 
     symbol_lists.resize(nodes.size());
     for (NodeId node_id = 0; node_id < static_cast<NodeId>(nodes.size()); ++node_id) {
@@ -353,7 +352,7 @@ AlphabetStore::AlphabetStore(
         }
     }
 
-    compute_effective_symbol_lists(nodes, project_plans, symbol_lists, effective_symbol_lists);
+    compute_effective_symbol_lists(nodes, plan_at_node, symbol_lists, effective_symbol_lists);
 }
 
 bool AlphabetStore::try_resolve_symbol(

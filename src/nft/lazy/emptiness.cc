@@ -25,19 +25,19 @@ namespace {
     // Only product-like nodes do non-trivial work that can be repeated: their iterators get
     // re-created for the same (node, state) pair across the search.  Leaves, Union, Identity, and
     // Project just forward or relabel — caching them would cost more than it saves.
-    constexpr bool should_cache_transitions(const NodeKind kind) noexcept {
+    constexpr bool should_cache_transitions(const ExecKind kind) noexcept {
         switch (kind) {
-            case NodeKind::Intersect:
-            case NodeKind::SyncProduct:
-            case NodeKind::Complement:
-            case NodeKind::DiagonalSlice:
+            case ExecKind::Intersect:
+            case ExecKind::SyncProduct:
+            case ExecKind::Complement:
+            case ExecKind::DiagonalSlice:
                 return true;
 
-            case NodeKind::LeafNfa:
-            case NodeKind::LeafNft:
-            case NodeKind::Union:
-            case NodeKind::Identity:
-            case NodeKind::Project:
+            case ExecKind::LeafNfa:
+            case ExecKind::LeafNft:
+            case ExecKind::Union:
+            case ExecKind::Identity:
+            case ExecKind::Project:
                 return false;
         }
         return false;
@@ -150,10 +150,25 @@ namespace {
 
         const std::vector<Nfa>& nfas;
         const std::vector<Nft>& nfts;
-        const std::vector<ProjectPlan>& project_plans;
 
         std::vector<ExecNode> nodes;
         std::vector<CompiledSyncPlan> sync_plans;
+        /// Per-exec-node type-erased plan pointer, parallel to @c nodes.
+        ///
+        /// For each exec node, the slot is interpreted by the node's @c ExecKind:
+        ///   - @c ExecKind::Project       → cast to @c const ProjectPlan*
+        ///                                  (points into @c formula.project_plans).
+        ///   - @c ExecKind::SyncProduct   → cast to @c const CompiledSyncPlan*
+        ///                                  (points into @c this->sync_plans).
+        ///   - all other kinds             → @c nullptr.
+        ///
+        /// Lifetime invariant: the pointed-to plans must remain live and at the same
+        /// address until @c is_empty returns. @c formula is held by const ref by
+        /// @c is_empty (so @c formula.project_plans cannot be modified or relocated),
+        /// and @c sync_plans is built once by @c compile_sync_plans before
+        /// reconstruction and never resized afterwards. Do not push_back into either
+        /// vector after Context construction completes.
+        std::vector<const void*> plan_at_node;
         MacroStateStore macro_store_;
         AlphabetStore alphabets;
         SubsumptionEngine subsumption;
@@ -163,15 +178,14 @@ namespace {
 
         Context(const SymbolicFormula& formula, NodeId root,
                 const std::vector<mata::OnTheFlyAlphabet>* root_level_alphabets = nullptr)
-            : nfas(formula.nfas), nfts(formula.nfts), project_plans(formula.project_plans), nodes{},
-              sync_plans{compile_sync_plans(formula.sync_plans)}, macro_store_{}, alphabets{},
+            : nfas(formula.nfas), nfts(formula.nfts), nodes{},
+              sync_plans{compile_sync_plans(formula.sync_plans)}, plan_at_node{}, macro_store_{}, alphabets{},
               subsumption{SubsumptionContext{nfas, nfts, nodes, macro_store_}},
               transition_tuple_helper{nodes, alphabets}, transition_cache{}, root_id{0} {
 
-            root_id = reconstruct_nodes(formula, root, nodes);
+            root_id = reconstruct_nodes(formula, root, sync_plans, nodes, plan_at_node);
             macro_store_ = MacroStateStore(nodes, nfas, nfts);
-            alphabets =
-                    AlphabetStore{nodes, root_id, nfas, nfts, formula.sync_plans, project_plans, root_level_alphabets};
+            alphabets = AlphabetStore{nodes, root_id, nfas, nfts, plan_at_node, root_level_alphabets};
             subsumption.initialize_leaf_simulations(root_id);
         }
 
@@ -197,15 +211,15 @@ namespace {
             const ExecNode& node = nodes[node_id];
 
             switch (node.kind) {
-                case NodeKind::LeafNfa:
+                case ExecKind::LeafNfa:
                     return std::make_unique<LeafNfaTransitionIterator>(
                             *this, nfas[node.lhs], alphabets, node_id, state);
 
-                case NodeKind::LeafNft:
+                case ExecKind::LeafNft:
                     return std::make_unique<LeafNftTransitionIterator>(
                             *this, nfts[node.lhs], alphabets, node_id, state, node.result_arity);
 
-                case NodeKind::Union: {
+                case ExecKind::Union: {
                     const TaggedState tagged = macro_store_.get_tagged(node_id, state);
                     const NodeId child_id = tagged.tag == TaggedState::Tag::Left ? node.lhs : node.rhs;
                     return make_mapped_transition_iterator(
@@ -219,25 +233,25 @@ namespace {
                             });
                 }
 
-                case NodeKind::Intersect: {
+                case ExecKind::Intersect: {
                     const PairState pair = macro_store_.get_pair(node_id, state);
                     return std::make_unique<IntersectTransitionIterator>(
                             *this, transition_tuple_helper, node_id, node.lhs, pair.lhs, node.rhs, pair.rhs);
                 }
 
-                case NodeKind::SyncProduct: {
+                case ExecKind::SyncProduct: {
                     const PairState pair = macro_store_.get_pair(node_id, state);
+                    const auto& plan = *static_cast<const CompiledSyncPlan*>(plan_at_node[node_id]);
                     return std::make_unique<SyncProductTransitionIterator>(
-                            *this, transition_tuple_helper, node_id, node.lhs, pair.lhs, node.rhs, pair.rhs,
-                            sync_plans[node.payload]);
+                            *this, transition_tuple_helper, node_id, node.lhs, pair.lhs, node.rhs, pair.rhs, plan);
                 }
 
-                case NodeKind::Complement:
+                case ExecKind::Complement:
                     return std::make_unique<ComplementTransitionIterator>(
                             *this, node_id, node.lhs, macro_store_.get_set(node_id, state), subsumption,
                             alphabets.level_symbols(node_id));
 
-                case NodeKind::Identity:
+                case ExecKind::Identity:
                     return make_mapped_transition_iterator(
                             *this, make_transition_iterator(node.lhs, state),
                             [](IteratorContext&, const GeneratedTransition& t) {
@@ -245,8 +259,8 @@ namespace {
                                 return GeneratedTransition{SymbolTuple{t.tuple[0], t.tuple[0]}, t.state};
                             });
 
-                case NodeKind::Project: {
-                    const ProjectPlan& plan = project_plans[node.payload];
+                case ExecKind::Project: {
+                    const auto& plan = *static_cast<const ProjectPlan*>(plan_at_node[node_id]);
                     return make_mapped_transition_iterator(
                             *this, make_transition_iterator(node.lhs, state),
                             [&plan](IteratorContext&, const GeneratedTransition& t) {
@@ -259,7 +273,7 @@ namespace {
                             });
                 }
 
-                case NodeKind::DiagonalSlice: {
+                case ExecKind::DiagonalSlice: {
                     const PairState pair = macro_store_.get_pair(node_id, state);
                     return std::make_unique<DiagonalSliceTransitionIterator>(
                             *this, node_id, node.lhs, pair.lhs, node.rhs, pair.rhs);
@@ -274,29 +288,29 @@ namespace {
             const ExecNode& node = nodes[node_id];
 
             switch (node.kind) {
-                case NodeKind::LeafNfa:
+                case ExecKind::LeafNfa:
                     return std::make_unique<LeafInitialStateIterator<Nfa>>(*this, nfas[node.lhs]);
 
-                case NodeKind::LeafNft:
+                case ExecKind::LeafNft:
                     return std::make_unique<LeafInitialStateIterator<Nft>>(*this, nfts[node.lhs]);
 
-                case NodeKind::Union:
+                case ExecKind::Union:
                     return std::make_unique<UnionInitialStateIterator>(
                             *this, node_id, make_initial_state_iterator(node.lhs),
                             make_initial_state_iterator(node.rhs));
 
-                case NodeKind::Intersect:
-                case NodeKind::SyncProduct:
-                case NodeKind::DiagonalSlice:
+                case ExecKind::Intersect:
+                case ExecKind::SyncProduct:
+                case ExecKind::DiagonalSlice:
                     return std::make_unique<ProductInitialStateIterator>(
                             *this, node_id, node.rhs, make_initial_state_iterator(node.lhs));
 
-                case NodeKind::Complement:
+                case ExecKind::Complement:
                     return std::make_unique<ComplementInitialStateIterator>(
                             *this, node_id, node.lhs, make_initial_state_iterator(node.lhs), subsumption);
 
-                case NodeKind::Identity:
-                case NodeKind::Project:
+                case ExecKind::Identity:
+                case ExecKind::Project:
                     return make_initial_state_iterator(node.lhs);
             }
 

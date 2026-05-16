@@ -19,7 +19,6 @@
 #define MATA_NFT_LAZY_HH
 
 #include <cstdint>
-#include <limits>
 #include <vector>
 
 #include "mata/nfa/nfa.hh"
@@ -31,8 +30,6 @@ namespace mata::nft::lazy {
 using NodeId = uint32_t;
 /// Identifier of a lazily constructed macrostate.
 using MacroStateId = uint32_t;
-/// Sentinel value for nodes without extra payload.
-constexpr uint32_t NO_PAYLOAD = std::numeric_limits<uint32_t>::max();
 
 
 /// Opaque handle to a node in the symbolic formula DAG.
@@ -49,10 +46,6 @@ public:
 };
 
 /// Kind of symbolic operator represented by a tree node.
-///
-/// `DiagonalSlice` is reconstruction-only, the public API never produces it directly,
-/// it is materialised by the reconstruction pass when it recognises the pattern
-/// `project(intersect(identity(U), X), [0|1])` (or its symmetric variants).
 enum class NodeKind : uint8_t {
     LeafNfa,
     LeafNft,
@@ -62,7 +55,6 @@ enum class NodeKind : uint8_t {
     Identity,
     Project,
     SyncProduct,
-    DiagonalSlice,
 };
 
 /// Reference one level of one side of a synchronized product.
@@ -96,6 +88,11 @@ struct ProjectPlan {
 };
 
 /// Compact record for one symbolic relation operator.
+///
+/// Plan-bearing kinds (`Project`, `SyncProduct`) are associated with their plan
+/// positionally: the k-th `Project` node (in build order) owns
+/// `project_plans[k]`, and analogously for `SyncProduct`. Builder methods
+/// maintain this invariant by appending the plan and the node atomically.
 struct Node {
     /// Operator kind.
     NodeKind kind;
@@ -105,17 +102,13 @@ struct Node {
     NodeId lhs;
     /// Right child when present.
     NodeId rhs;
-    /// Index into an auxiliary plan table when needed.
-    uint32_t payload;
 };
 
 /// DAG of symbolic relation operators evaluated lazily for emptiness checking.
 class SymbolicFormula {
     NodeId insert_leaf(NodeKind kind, NodeId leaf_id, uint8_t result_arity);
-    NodeId insert_unary(NodeKind kind, NodeId child, uint8_t result_arity, uint32_t payload = NO_PAYLOAD);
-    NodeId insert_binary(NodeKind kind, NodeId lhs, NodeId rhs, uint8_t result_arity, uint32_t payload = NO_PAYLOAD);
-    uint32_t add_sync_plan(SyncPlan plan);
-    uint32_t add_project_plan(ProjectPlan plan);
+    NodeId insert_unary(NodeKind kind, NodeId child, uint8_t result_arity);
+    NodeId insert_binary(NodeKind kind, NodeId lhs, NodeId rhs, uint8_t result_arity);
 
 public:
     /// Owned NFA leaves referenced by leaf nodes.

@@ -48,14 +48,14 @@ public:
      * @param root_id Root exec node id.
      * @param nfas Source NFA leaves.
      * @param nfts Source NFT leaves.
-     * @param sync_plans Sync-product plans referenced by exec nodes.
-     * @param project_plans Projection plans referenced by exec nodes.
+     * @param plan_at_node Per-node type-erased plan pointers (parallel to @p nodes).
+     *                     For @c ExecKind::Project: @c const ProjectPlan*; for
+     *                     @c ExecKind::SyncProduct: @c const CompiledSyncPlan*; nullptr otherwise.
      * @param root_level_alphabets Optional explicit root alphabets.
      */
     AlphabetStore(
             const std::vector<ExecNode>& nodes, NodeId root_id, const std::vector<mata::nfa::Nfa>& nfas,
-            const std::vector<mata::nft::Nft>& nfts, const std::vector<SyncPlan>& sync_plans,
-            const std::vector<ProjectPlan>& project_plans,
+            const std::vector<mata::nft::Nft>& nfts, const std::vector<const void*>& plan_at_node,
             const std::vector<mata::OnTheFlyAlphabet>* root_level_alphabets = nullptr);
 
     /**

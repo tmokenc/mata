@@ -25,8 +25,8 @@ namespace {
     /// the walk (transparent kinds share their child's store).
     NodeId resolve_macrostate_owner(const std::vector<ExecNode>& nodes, NodeId nid) {
         while (nid < nodes.size()) {
-            const NodeKind k = nodes[nid].kind;
-            if (k == NodeKind::Identity || k == NodeKind::Project) {
+            const ExecKind k = nodes[nid].kind;
+            if (k == ExecKind::Identity || k == ExecKind::Project) {
                 nid = nodes[nid].lhs;
             } else {
                 break;
@@ -66,26 +66,26 @@ void SubsumptionEngine::configure_antichain_filter(const NodeId root_id) {
     // Resolve the root through any leading transparent wrappers; macrostate ids are
     // shared across the chain so the resolved node owns the relevant store.
     const NodeId root_owner = resolve_macrostate_owner(context.nodes, root_id);
-    const NodeKind root_kind = context.nodes[root_owner].kind;
+    const ExecKind root_kind = context.nodes[root_owner].kind;
 
     switch (root_kind) {
-        case NodeKind::Union:
+        case ExecKind::Union:
             // Subsumption requires matching tags — use the tag as an equality discriminator
             // so only same-side entries are compared.
             fingerprint_program.steps.push_back({FpOp::EmitTag, root_owner});
             fingerprint_program.range_kind = FpRangeKind::Equality;
             break;
 
-        case NodeKind::Complement:
+        case ExecKind::Complement:
             // Complement subsumption reverses the subset order: s1 ⊑ s2 iff sub(s2) ⊆ sub(s1).
             // Bucket by set size and check only entries with size ≤ the query.
             fingerprint_program.steps.push_back({FpOp::EmitSetSize, root_owner});
             fingerprint_program.range_kind = FpRangeKind::LessOrEqual;
             break;
 
-        case NodeKind::Intersect:
-        case NodeKind::SyncProduct:
-        case NodeKind::DiagonalSlice: {
+        case ExecKind::Intersect:
+        case ExecKind::SyncProduct:
+        case ExecKind::DiagonalSlice: {
             // Look for a Complement on the rhs (possibly through transparent wrappers).
             // Walking through Identity / Project is sound because they share their child's
             // macrostate store, so the unpacked pair.rhs id is valid in the resolved
@@ -94,7 +94,7 @@ void SubsumptionEngine::configure_antichain_filter(const NodeId root_id) {
             const NodeId rhs_owner = resolve_macrostate_owner(context.nodes, rhs_raw);
 
             if (rhs_owner < context.nodes.size() &&
-                context.nodes[rhs_owner].kind == NodeKind::Complement) {
+                context.nodes[rhs_owner].kind == ExecKind::Complement) {
                 // Outer key: pair.lhs id (equality grouping — pair subsumption requires
                 // lhs1 ⊑ lhs2, which without sim means equality).
                 outer_key_program.steps.push_back({FpOp::UnpackPairLhs, root_owner});
@@ -109,7 +109,7 @@ void SubsumptionEngine::configure_antichain_filter(const NodeId root_id) {
                 const NodeId lhs_raw = context.nodes[root_owner].lhs;
                 const NodeId lhs_owner = resolve_macrostate_owner(context.nodes, lhs_raw);
                 if (lhs_owner < context.nodes.size() &&
-                    context.nodes[lhs_owner].kind == NodeKind::LeafNfa) {
+                    context.nodes[lhs_owner].kind == ExecKind::LeafNfa) {
                     filter_lhs_nfa_index = context.nodes[lhs_owner].lhs;
                 }
             }
@@ -229,29 +229,29 @@ void SubsumptionEngine::initialize_leaf_simulations_impl(const NodeId node_id, s
     const ExecNode& node = context.nodes[node_id];
 
     switch (node.kind) {
-        case NodeKind::LeafNfa: {
+        case ExecKind::LeafNfa: {
             Simlib::Util::BinaryRelation relation = mata::nfa::algorithms::compute_relation(context.nfas[node.lhs]);
             precomputed_simulation_nfas[node.lhs] = std::move(relation);
             break;
         }
 
-        case NodeKind::LeafNft: {
+        case ExecKind::LeafNft: {
             Simlib::Util::BinaryRelation relation = mata::nft::algorithms::compute_relation(context.nfts[node.lhs]);
             precomputed_simulation_nfts[node.lhs] = std::move(relation);
             break;
         }
 
-        case NodeKind::Union:
-        case NodeKind::Intersect:
-        case NodeKind::SyncProduct:
-        case NodeKind::DiagonalSlice:
+        case ExecKind::Union:
+        case ExecKind::Intersect:
+        case ExecKind::SyncProduct:
+        case ExecKind::DiagonalSlice:
             initialize_leaf_simulations_impl(node.lhs, visited);
             initialize_leaf_simulations_impl(node.rhs, visited);
             break;
 
-        case NodeKind::Complement:
-        case NodeKind::Identity:
-        case NodeKind::Project:
+        case ExecKind::Complement:
+        case ExecKind::Identity:
+        case ExecKind::Project:
             initialize_leaf_simulations_impl(node.lhs, visited);
             break;
     }
@@ -270,15 +270,15 @@ bool SubsumptionEngine::subsumed_state(const NodeId node_id, const MacroStateId 
     bool result = false;
 
     switch (node.kind) {
-        case NodeKind::LeafNfa:
+        case ExecKind::LeafNfa:
             result = precomputed_simulation_nfas[node.lhs].get(s1, s2);
             break;
 
-        case NodeKind::LeafNft:
+        case ExecKind::LeafNft:
             result = precomputed_simulation_nfts[node.lhs].get(s1, s2);
             break;
 
-        case NodeKind::Union: {
+        case ExecKind::Union: {
             if (const std::optional<bool> cached_result = caches[node_id].get(state1, state2)) {
                 return *cached_result;
             }
@@ -296,9 +296,9 @@ bool SubsumptionEngine::subsumed_state(const NodeId node_id, const MacroStateId 
             break;
         }
 
-        case NodeKind::Intersect:
-        case NodeKind::SyncProduct:
-        case NodeKind::DiagonalSlice: {
+        case ExecKind::Intersect:
+        case ExecKind::SyncProduct:
+        case ExecKind::DiagonalSlice: {
             if (const std::optional<bool> cached_result = caches[node_id].get(state1, state2)) {
                 return *cached_result;
             }
@@ -311,7 +311,7 @@ bool SubsumptionEngine::subsumed_state(const NodeId node_id, const MacroStateId 
             break;
         }
 
-        case NodeKind::Complement: {
+        case ExecKind::Complement: {
             if (const std::optional<bool> cached_result = caches[node_id].get(state1, state2)) {
                 return *cached_result;
             }
@@ -348,8 +348,8 @@ bool SubsumptionEngine::subsumed_state(const NodeId node_id, const MacroStateId 
             break;
         }
 
-        case NodeKind::Identity:
-        case NodeKind::Project:
+        case ExecKind::Identity:
+        case ExecKind::Project:
             result = subsumed_state(node.lhs, state1, state2);
             break;
     }
